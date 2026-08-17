@@ -744,10 +744,20 @@ typedef struct {
 
 void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
   GPT2State *state, int *prompt_tokens, int num_prompt,
-  TokenProbability *vocab_probs) {
+  TokenProbability *vocab_probs, int **tokens, int *token_len) {
   float *wte_ptr, *wpe_ptr, *ln_f_w_ptr, *ln_f_b_ptr, *lm_head_ptr;
   int current_token = prompt_tokens[0];
   int pos = 0;
+  int capacity = num_prompt + param->max_gen_tokens;
+  int count = 0;
+
+  *tokens = (int *)malloc(capacity * sizeof(int));
+  if (!(*tokens)) {
+    fprintf(stderr, "Error: Memory allocation failed for tokens in generate\n");
+    *token_len = 0;
+    return;
+  }
+
   tensor_to_float(&state->buf, &w->wte, &wte_ptr, NULL);
   tensor_to_float(&state->buf, &w->wpe, &wpe_ptr, NULL);
   tensor_to_float(&state->buf, &w->ln_f_w, &ln_f_w_ptr, NULL);
@@ -779,14 +789,22 @@ void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
       printf("Step %d | Token: %d\n", pos, next_token);
       if (next_token == config->eos_token_id) {
         printf("EOS token (%d), stoped.\n", config->eos_token_id);
+        if (count < capacity) {
+          (*tokens)[count++] = next_token;
+        }
         break;
       }
+    }
+
+    if (count < capacity) {
+      (*tokens)[count++] = next_token;
     }
 
     pos++;
     current_token = next_token;
     if (pos >= config->n_positions) break;
   }
+  *token_len = count;
 }
 
 int main(void) {
@@ -797,10 +815,10 @@ int main(void) {
   GPT2Param param;
   GPT2Weights w;
   GPT2Config config;
-  float *ptr;
+  float *ptr, *tokens;
   GPT2State state;
   int prompt_tokens[8];
-  int num_prompt;
+  int num_prompt, n_tokens = 0;
   TokenProbability *vocab_probs;
   struct timespec start, end;
   double time_spent;
@@ -880,8 +898,8 @@ int main(void) {
 
   clock_gettime(CLOCK_MONOTONIC, &start);
 
-  generate(&w, &config, &param, &state, prompt_tokens, num_prompt, vocab_probs);
-  
+  generate(&w, &config, &param, &state, prompt_tokens, num_prompt, vocab_probs, &tokens, &n_tokens);
+  if (tokens) free(tokens);
   clock_gettime(CLOCK_MONOTONIC, &end);
   time_spent = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
   printf("Inference finished in %f seconds.\n", time_spent);
