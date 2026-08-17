@@ -371,7 +371,7 @@ float random_f32() {
   return (float)random_u32() / (float)4294967296.0f;
 }
 
-int sample(float *logits, int vocab_size, float temperature, int top_k, float top_p) {
+int sample(float *logits, int vocab_size, float temperature, int top_k, float top_p, TokenProbability *vocab_probs) {
   if (temperature == 0.0f) {
     int max_i = 0;
     float max_p = logits[0];
@@ -401,19 +401,18 @@ int sample(float *logits, int vocab_size, float temperature, int top_k, float to
     logits[i] /= sum;
   }
 
-  TokenProbability *vocab_probs = (TokenProbability *)malloc(vocab_size * sizeof(TokenProbability));
   for (int i = 0; i < vocab_size; i++) {
     vocab_probs[i].prob = logits[i];
     vocab_probs[i].index = i;
   }
 
+  qsort(vocab_probs, vocab_size, sizeof(TokenProbability), compare_tokens);
+
   int effective_vocab_size = vocab_size;
   if (top_k > 0 && top_k < vocab_size) {
-    qsort(vocab_probs, vocab_size, sizeof(TokenProbability), compare_tokens);
     effective_vocab_size = top_k;
-  } else {
-    qsort(vocab_probs, vocab_size, sizeof(TokenProbability), compare_tokens);
   }
+
   if (top_p > 0.0f && top_p < 1.0f) {
     float cumulative_prob = 0.0f;
     int last_idx = effective_vocab_size;
@@ -431,6 +430,7 @@ int sample(float *logits, int vocab_size, float temperature, int top_k, float to
   for (int i = 0; i < effective_vocab_size; i++) {
     cumulative_sum += vocab_probs[i].prob;
   }
+  
   float r = random_f32() * cumulative_sum;
   float cdf = 0.0f;
   int next_token = vocab_probs[0].index;
@@ -442,7 +442,6 @@ int sample(float *logits, int vocab_size, float temperature, int top_k, float to
     }
   }
 
-  free(vocab_probs);
   return next_token;
 }
 
@@ -517,6 +516,7 @@ int main() {
 
   int current_token = prompt_tokens[0];
   int pos = 0;
+  TokenProbability *vocab_probs = (TokenProbability*)malloc(config.vocab_size * sizeof(TokenProbability));
   
   clock_t start = clock();
 
@@ -542,7 +542,7 @@ int main() {
       /* Logits */
       matmul(state.logits, state.final, w.lm_head, NULL, config.n_embd, config.vocab_size);
 
-      next_token = sample(state.logits, config.vocab_size, param.temperature, param.top_k, param.top_p);
+      next_token = sample(state.logits, config.vocab_size, param.temperature, param.top_k, param.top_p, vocab_probs);
       printf("Step %d | Token: %d\n", pos, next_token);
     }
 
@@ -557,6 +557,7 @@ int main() {
 
   free(memory);
   free(w.layers);
+  free(vocab_probs);
   GPT2State_free(&state);
   return 0;
 }
