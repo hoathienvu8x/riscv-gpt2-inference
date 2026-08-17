@@ -7,6 +7,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 
 /*
  *  ABLATION CONFIGURATION
@@ -27,6 +28,27 @@
 #define SQRT_2_PI 0.7978845608f
 #define C_GELU 0.044715f
 
+typedef struct {
+  float *data;
+  size_t pos, capacity;
+} FloatBuffer;
+
+typedef enum {
+  GPT2_DTYPE_UNKNOWN = 0,
+  GPT2_DTYPE_F32,
+  GPT2_DTYPE_F16,
+  GPT2_DTYPE_BF16,
+  GPT2_DTYPE_I32,
+  GPT2_DTYPE_I64
+} GPT2DType;
+
+typedef struct {
+  GPT2DType dtype;
+  int shape[4], ndim;
+  uint64_t start_offset, end_offset;
+  void *data;
+} GPT2Tensor;
+
 typedef enum {
   GPT2_ACTIVATION_UNKNOWN = 0,
   GPT2_ACTIVATION_GELU,
@@ -44,20 +66,20 @@ typedef struct {
 } GPT2Config;
 
 typedef struct {
-  float *ln1_w, *ln1_b;
-  float *attn_w, *attn_b;
-  float *attn_proj_w, *attn_proj_b;
-  float *ln2_w, *ln2_b;
-  float *mlp_fc_w, *mlp_fc_b;
-  float *mlp_proj_w, *mlp_proj_b;
+  GPT2Tensor ln1_w, ln1_b;
+  GPT2Tensor attn_w, attn_b;
+  GPT2Tensor attn_proj_w, attn_proj_b;
+  GPT2Tensor ln2_w, ln2_b;
+  GPT2Tensor mlp_fc_w, mlp_fc_b;
+  GPT2Tensor mlp_proj_w, mlp_proj_b;
 } GPT2Layers;
 
 typedef struct {
-  float *wte; /* [VOCAB, D_MODEL] */
-  float *wpe; /* [MAX_SEQ, D_MODEL] */
+  GPT2Tensor wte; /* [VOCAB, D_MODEL] */
+  GPT2Tensor wpe; /* [MAX_SEQ, D_MODEL] */
   GPT2Layers *layers;
-  float *ln_f_w, *ln_f_b;
-  float *lm_head;
+  GPT2Tensor ln_f_w, ln_f_b;
+  GPT2Tensor lm_head;
 } GPT2Weights;
 
 typedef struct {
@@ -79,6 +101,7 @@ typedef struct {
   float *ln2_out;
   float *mlp_hidden;
   float *mlp_out;
+  FloatBuffer buf;
 } GPT2State;
 
 
@@ -378,25 +401,148 @@ void attention(float *out, float *x,
   matmul(out, state->attn_out, c_proj_w, c_proj_b, n_embd, n_embd);
 }
 
+float fp16_to_fp32(uint16_t h) {
+  uint32_t sign = ((h >> 15) & 1);
+  uint32_t exp  = ((h >> 10) & 0x1f);
+  uint32_t mant = (h & 0x3ff);
+  
+  uint32_t f_val;
+  if (exp == 0) {
+    if (mant == 0) {
+      f_val = (sign << 31);
+    } else {
+      exp = 127 - 15 - 10;
+      while (!(mant & 0x400)) {
+        mant <<= 1;
+        exp--;
+      }
+      mant &= 0x3ff;
+      f_val = (sign << 31) | (exp << 23) | (mant << 13);
+    }
+  } else if (exp == 31) {
+    f_val = (sign << 31) | (0xff << 23) | (mant ? (mant << 13) : 0);
+  } else {
+    f_val = (sign << 31) | ((exp + (127 - 15)) << 23) | (mant << 13);
+  }
+  float f;
+  memcpy(&f, &f_val, sizeof(float));
+  return f;
+}
+
+float bf16_to_fp32(uint16_t bf) {
+  uint32_t f_val = ((uint32_t)bf) << 16;
+  float f;
+  memcpy(&f, &f_val, sizeof(float));
+  return f;
+}
+
+int tensor_to_float(FloatBuffer *buf, const GPT2Tensor *tensor, float **out, int *size) {
+  int total_elements = 1;
+  int i;
+  size_t required_pos;
+
+  for (i = 0; i < tensor->ndim; i++) {
+    total_elements *= tensor->shape[i];
+  }
+  if (tensor->ndim == 0) total_elements = 1;
+
+  if (tensor->dtype == GPT2_DTYPE_F32) {
+    *out = (float *)tensor->data;
+    if (size) *size = total_elements;
+    return 0;
+  }
+
+  required_pos = buf->pos + total_elements;
+  if (required_pos > buf->capacity) {
+    size_t new_cap = buf->capacity * 2;
+    float *new_data;
+    if (new_cap < required_pos) new_cap = required_pos + 1024;
+    new_data = (float*)realloc(buf->data, new_cap * sizeof(float));
+    if (!new_data) return -1;
+    buf->data = new_data;
+    buf->capacity = new_cap;
+  }
+
+  *out = buf->data + buf->pos;
+  if (size) *size = total_elements;
+
+  switch (tensor->dtype) {
+    case GPT2_DTYPE_I32: {
+      int i;
+      int32_t *src = (int32_t *)tensor->data;
+      for (i = 0; i < total_elements; i++) {
+        (*out)[i] = (float)src[i];
+      }
+      break;
+    }
+    case GPT2_DTYPE_I64: {
+      int i;
+      int64_t *src = (int64_t *)tensor->data;
+      for (i = 0; i < total_elements; i++) {
+        (*out)[i] = (float)src[i];
+      }
+      break;
+    }
+    case GPT2_DTYPE_F16: {
+      int i;
+      uint16_t *src = (uint16_t *)tensor->data;
+      for (i = 0; i < total_elements; i++) {
+        (*out)[i] = fp16_to_fp32(src[i]);
+      }
+      break;
+    }
+    case GPT2_DTYPE_BF16: {
+      int i;
+      uint16_t *src = (uint16_t *)tensor->data;
+      for (i = 0; i < total_elements; i++) {
+        (*out)[i] = bf16_to_fp32(src[i]);
+      }
+      break;
+    }
+    default: return -1;
+  }
+
+  buf->pos = required_pos;
+  return 0;
+}
+
 void transformer_block(float *x, GPT2Weights *w, GPT2State *s, GPT2Config *config, int layer, int pos) {
   int n_embd = config->n_embd;
+  float *w_ptr1, *w_ptr2, *w_ptr3, *w_ptr4;
   memcpy(s->resid, x, n_embd * sizeof(float));
 
-  layernorm(s->ln1_out, x, w->layers[layer].ln1_w, w->layers[layer].ln1_b, config->layer_norm_epsilon, n_embd);
+  tensor_to_float(&s->buf, &w->layers[layer].ln1_w, &w_ptr1, NULL);
+  tensor_to_float(&s->buf, &w->layers[layer].ln1_b, &w_ptr2, NULL);
 
-  attention(s->attn_out, s->ln1_out, w->layers[layer].attn_w, w->layers[layer].attn_b, 
-            w->layers[layer].attn_proj_w, w->layers[layer].attn_proj_b, s, config, layer, pos);
+  layernorm(s->ln1_out, x, w_ptr1, w_ptr2, config->layer_norm_epsilon, n_embd);
+  s->buf.pos = 0;
+
+  tensor_to_float(&s->buf, &w->layers[layer].attn_w, &w_ptr1, NULL);
+  tensor_to_float(&s->buf, &w->layers[layer].attn_b, &w_ptr2, NULL);
+  tensor_to_float(&s->buf, &w->layers[layer].attn_proj_w, &w_ptr3, NULL);
+  tensor_to_float(&s->buf, &w->layers[layer].attn_proj_b, &w_ptr4, NULL);
+
+  attention(s->attn_out, s->ln1_out, w_ptr1, w_ptr2, 
+            w_ptr3, w_ptr4, s, config, layer, pos);
+  s->buf.pos = 0;
   
   add(x, s->resid, s->attn_out, n_embd);
   memcpy(s->resid, x, n_embd * sizeof(float));
 
-  layernorm(s->ln2_out, x, w->layers[layer].ln2_w, w->layers[layer].ln2_b, config->layer_norm_epsilon, n_embd);
+  tensor_to_float(&s->buf, &w->layers[layer].ln2_w, &w_ptr1, NULL);
+  tensor_to_float(&s->buf, &w->layers[layer].ln2_b, &w_ptr2, NULL);
+  layernorm(s->ln2_out, x, w_ptr1, w_ptr2, config->layer_norm_epsilon, n_embd);
+  s->buf.pos = 0;
 
-  matmul(s->mlp_hidden, s->ln2_out, w->layers[layer].mlp_fc_w, w->layers[layer].mlp_fc_b, n_embd, 4 * n_embd);
+  tensor_to_float(&s->buf, &w->layers[layer].mlp_fc_w, &w_ptr1, NULL);
+  tensor_to_float(&s->buf, &w->layers[layer].mlp_fc_b, &w_ptr2, NULL);
+  matmul(s->mlp_hidden, s->ln2_out, w_ptr1, w_ptr2, n_embd, 4 * n_embd);
+  s->buf.pos = 0;
   
   apply_activate(s->mlp_hidden, 4 * n_embd, config->activation_type);
-  
-  matmul(s->mlp_out, s->mlp_hidden, w->layers[layer].mlp_proj_w, w->layers[layer].mlp_proj_b, 4 * n_embd, n_embd);
+  tensor_to_float(&s->buf, &w->layers[layer].mlp_proj_w, &w_ptr1, NULL);
+  tensor_to_float(&s->buf, &w->layers[layer].mlp_proj_b, &w_ptr2, NULL);
+  matmul(s->mlp_out, s->mlp_hidden, w_ptr1, w_ptr2, 4 * n_embd, n_embd);
 
   add(x, s->resid, s->mlp_out, n_embd);
 }
@@ -428,6 +574,9 @@ void GPT2State_init(GPT2State *state, GPT2Config *config) {
     state->ln2_out = (float *)malloc(config->n_embd * sizeof(float));
     state->mlp_hidden = (float *)malloc(4 * config->n_embd * sizeof(float));
     state->mlp_out = (float *)malloc(config->n_embd * sizeof(float));  
+    state->buf.data = NULL;
+    state->buf.pos = 0;
+    state->buf.capacity = 0;
 
     if (
       !state->key_cache || !state->value_cache || !state->x || !state->logits || 
@@ -456,6 +605,12 @@ void GPT2State_free(GPT2State *state) {
   if (state->ln2_out) { free(state->ln2_out); state->ln2_out = NULL; }
   if (state->mlp_hidden) { free(state->mlp_hidden); state->mlp_hidden = NULL; }
   if (state->mlp_out) { free(state->mlp_out); state->mlp_out = NULL; }
+  if (state->buf.data) {
+    free(state->buf.data);
+    state->buf.data = NULL;
+    state->buf.pos = 0;
+    state->buf.capacity = 0;
+  }
 }
 
 typedef struct {
@@ -580,26 +735,32 @@ typedef struct {
 void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
   GPT2State *state, int *prompt_tokens, int num_prompt,
   TokenProbability *vocab_probs) {
+  float *wte_ptr, *wpe_ptr, *ln_f_w_ptr, *ln_f_b_ptr, *lm_head_ptr;
   int current_token = prompt_tokens[0];
   int pos = 0;
+  tensor_to_float(&state->buf, &w->wte, &wte_ptr, NULL);
+  tensor_to_float(&state->buf, &w->wpe, &wpe_ptr, NULL);
+  tensor_to_float(&state->buf, &w->ln_f_w, &ln_f_w_ptr, NULL);
+  tensor_to_float(&state->buf, &w->ln_f_b, &ln_f_b_ptr, NULL);
+  tensor_to_float(&state->buf, &w->lm_head, &lm_head_ptr, NULL);
   while (pos < num_prompt + param->max_gen_tokens) {
     int i;
     int next_token;
 
     for(i = 0; i < config->n_embd; i++) {
-      state->x[i] = w->wte[current_token * config->n_embd + i] + w->wpe[pos * config->n_embd + i];
+      state->x[i] = wte_ptr[current_token * config->n_embd + i] + wpe_ptr[pos * config->n_embd + i];
     }
 
     for(i = 0; i < config->n_layer; i++) {
       transformer_block(state->x, w, state, config, i, pos);
     }
 
-    layernorm(state->final, state->x, w->ln_f_w, w->ln_f_b, config->layer_norm_epsilon, config->n_embd);
+    layernorm(state->final, state->x, ln_f_w_ptr, ln_f_b_ptr, config->layer_norm_epsilon, config->n_embd);
 
     if (pos < num_prompt - 1) {
       next_token = prompt_tokens[pos + 1];
     } else {
-      matmul(state->logits, state->final, w->lm_head, NULL, config->n_embd, config->vocab_size);
+      matmul(state->logits, state->final, lm_head_ptr, NULL, config->n_embd, config->vocab_size);
       next_token = sample(state->logits, config->vocab_size, param->temperature, param->top_k, param->top_p, vocab_probs);
       printf("Step %d | Token: %d\n", pos, next_token);
     }
@@ -611,6 +772,7 @@ void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
 }
 
 int main(void) {
+  #if 0
   FILE *f;
   long filesize;
   float *memory;
@@ -708,5 +870,6 @@ int main(void) {
   free(w.layers);
   free(vocab_probs);
   GPT2State_free(&state);
+  #endif
   return 0;
 }
