@@ -2,7 +2,7 @@ TARGET = gpt2
 
 CC = gcc
 
-CFLAGS = -std=c99 -Wall -Wextra
+CFLAGS = -std=c89 -Wall -Wextra
 
 LDFLAGS = -lm
 
@@ -28,7 +28,7 @@ directories:
 	@mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/$(TARGET): $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS)
