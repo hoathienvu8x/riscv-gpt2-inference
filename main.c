@@ -346,6 +346,114 @@ void GPT2State_free(GPT2State *state) {
   free(state->mlp_out);
 }
 
+typedef struct {
+  float prob;
+  int index;
+} TokenProbability;
+
+int compare_tokens(const void *a, const void *b) {
+  TokenProbability *x = (TokenProbability *)a;
+  TokenProbability *y = (TokenProbability *)b;
+  if (x->prob > y->prob) return -1;
+  if (x->prob < y->prob) return 1;
+  return 0;
+}
+
+unsigned long long rng_seed = 0;
+void set_seed(unsigned long long seed) {
+  rng_seed = seed;
+}
+unsigned int random_u32() {
+  rng_seed = rng_seed * 6364136223846793005ULL + 1442695040888963407ULL;
+  return (unsigned int)(rng_seed >> 32);
+}
+float random_f32() {
+  return (float)random_u32() / (float)4294967296.0f;
+}
+
+int sample(float *logits, int vocab_size, float temperature, int top_k, float top_p) {
+  if (temperature == 0.0f) {
+    int max_i = 0;
+    float max_p = logits[0];
+    for (int i = 1; i < vocab_size; i++) {
+      if (logits[i] > max_p) {
+        max_p = logits[i];
+        max_i = i;
+      }
+    }
+    return max_i;
+  }
+
+  for (int i = 0; i < vocab_size; i++) {
+    logits[i] /= temperature;
+  }
+
+  float max_val = logits[0];
+  for (int i = 1; i < vocab_size; i++) {
+    if (logits[i] > max_val) max_val = logits[i];
+  }
+  float sum = 0.0f;
+  for (int i = 0; i < vocab_size; i++) {
+    logits[i] = expf(logits[i] - max_val);
+    sum += logits[i];
+  }
+  for (int i = 0; i < vocab_size; i++) {
+    logits[i] /= sum;
+  }
+
+  TokenProbability *vocab_probs = (TokenProbability *)malloc(vocab_size * sizeof(TokenProbability));
+  for (int i = 0; i < vocab_size; i++) {
+    vocab_probs[i].prob = logits[i];
+    vocab_probs[i].index = i;
+  }
+
+  int effective_vocab_size = vocab_size;
+  if (top_k > 0 && top_k < vocab_size) {
+    qsort(vocab_probs, vocab_size, sizeof(TokenProbability), compare_tokens);
+    effective_vocab_size = top_k;
+  } else {
+    qsort(vocab_probs, vocab_size, sizeof(TokenProbability), compare_tokens);
+  }
+  if (top_p > 0.0f && top_p < 1.0f) {
+    float cumulative_prob = 0.0f;
+    int last_idx = effective_vocab_size;
+    for (int i = 0; i < effective_vocab_size; i++) {
+      cumulative_prob += vocab_probs[i].prob;
+      if (cumulative_prob > top_p) {
+        last_idx = i + 1;
+        break;
+      }
+    }
+    effective_vocab_size = last_idx;
+  }
+
+  float cumulative_sum = 0.0f;
+  for (int i = 0; i < effective_vocab_size; i++) {
+    cumulative_sum += vocab_probs[i].prob;
+  }
+  float r = random_f32() * cumulative_sum;
+  float cdf = 0.0f;
+  int next_token = vocab_probs[0].index;
+  for (int i = 0; i < effective_vocab_size; i++) {
+    cdf += vocab_probs[i].prob;
+    if (r < cdf) {
+      next_token = vocab_probs[i].index;
+      break;
+    }
+  }
+
+  free(vocab_probs);
+  return next_token;
+}
+
+typedef struct {
+  int max_gen_tokens;
+  float temperature;
+  int top_k;
+  float top_p;
+  unsigned long long seed;
+} GPT2Param;
+
 int main() {
   printf("ABLATIONS:\n");
   printf("MatMul:    %s\n", MODE_MATMUL);
@@ -365,7 +473,7 @@ int main() {
     free(memory); fclose(f); return 1;
   }
   fclose(f);
-
+  GPT2Param param = {0};
   GPT2Weights w;
   GPT2Config config;
   float *ptr = memory;
@@ -391,22 +499,28 @@ int main() {
   w.ln_f_b = ptr; ptr += config.n_embd;
   w.lm_head = ptr;
 
+  param.max_gen_tokens = 10;
+  param.temperature = 0.7f;
+  param.top_k = 40;
+  param.top_p = 0.9f;
+  param.seed = 42;
+
   GPT2State state;
   GPT2State_init(&state, &config);
+  set_seed(param.seed);
 
   /* Prompt: "The quick brown fox jumps over the lazy" */
   int prompt_tokens[] = { 464, 2068, 7586, 21831, 18045, 625, 262, 16931 };
   int num_prompt = sizeof(prompt_tokens) / sizeof(int);
-  int tokens_to_generate = 10; 
 
-  printf("Prompt Length: %d. Generating %d tokens.\n", num_prompt, tokens_to_generate);
+  printf("Prompt Length: %d. Generating %d tokens.\n", num_prompt, param.max_gen_tokens);
 
   int current_token = prompt_tokens[0];
   int pos = 0;
   
   clock_t start = clock();
 
-  while (pos < num_prompt + tokens_to_generate) {
+  while (pos < num_prompt + param.max_gen_tokens) {
     /* Embedding */
     for(int i=0; i<config.n_embd; i++) {
       state.x[i] = w.wte[current_token * config.n_embd + i] + w.wpe[pos * config.n_embd + i];
@@ -427,16 +541,8 @@ int main() {
     } else {
       /* Logits */
       matmul(state.logits, state.final, w.lm_head, NULL, config.n_embd, config.vocab_size);
-      
-      float max_prob = -1e9;
-      int argmax = 0;
-      for(int i=0; i<config.vocab_size; i++) {
-        if (state.logits[i] > max_prob) {
-          max_prob = state.logits[i];
-          argmax = i;
-        }
-      }
-      next_token = argmax;
+
+      next_token = sample(state.logits, config.vocab_size, param.temperature, param.top_k, param.top_p);
       printf("Step %d | Token: %d\n", pos, next_token);
     }
 
