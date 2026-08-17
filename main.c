@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 199309L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -13,9 +15,9 @@
 #define ENABLE_RVV_MATMUL     0 
 #define ENABLE_RVV_LAYERNORM  0 
 #define ENABLE_RVV_ADD        0
-#define ENABLE_RVV_GELU       0
+#define ENABLE_RVV_ACTIVATION       0
 
-#if (ENABLE_RVV_MATMUL || ENABLE_RVV_LAYERNORM || ENABLE_RVV_ADD || ENABLE_RVV_GELU)
+#if (ENABLE_RVV_MATMUL || ENABLE_RVV_LAYERNORM || ENABLE_RVV_ADD || ENABLE_RVV_ACTIVATION)
   #include <riscv_vector.h>
   #define HAS_RVV_HEADER 1
 #endif
@@ -98,6 +100,59 @@ void add(float *out, float *a, float *b, int size) {
 }
 
 void apply_activate(float *x, int size, GPT2Activation act_type) {
+  #if defined(HAS_RVV_HEADER) && ENABLE_RVV_ACTIVATION
+    size_t vl;
+    for (int i = 0; i < size; i += vl) {
+      vl = __riscv_vsetvl_e32m8(size - i);
+      vfloat32m8_t xv = __riscv_vle32_v_f32m8(x + i, vl);
+      
+      float temp_buf[vl];
+      __riscv_vse32_v_f32m8(temp_buf, xv, vl);
+
+      for (size_t j = 0; j < vl; j++) {
+        float val = temp_buf[j];
+        switch (act_type) {
+          case GPT2_ACTIVATION_GELU: {
+            float cube = C_GELU * val * val * val;
+            float inner = SQRT_2_PI * (val + cube);
+            temp_buf[j] = 0.5f * val * (1.0f + tanhf(inner));
+            break;
+          }
+          case GPT2_ACTIVATION_GELU_NEW: {
+            float inner = 0.7978845608f * (val + 0.044715f * val * val * val);
+            temp_buf[j] = 0.5f * val * (1.0f + tanhf(inner));
+            break;
+          }
+          case GPT2_ACTIVATION_GELU_FAST: {
+            temp_buf[j] = val * (0.5f * (1.0f + tanhf(0.797885f * (val + 0.044715f * val * val * val))));
+            break;
+          }
+          case GPT2_ACTIVATION_RELU: {
+            temp_buf[j] = (val > 0.0f) ? val : 0.0f;
+            break;
+          }
+          case GPT2_ACTIVATION_SILU: {
+            temp_buf[j] = val / (1.0f + expf(-val));
+            break;
+          }
+          case GPT2_ACTIVATION_TANH: {
+            temp_buf[j] = tanhf(val);
+            break;
+          }
+          case GPT2_ACTIVATION_UNKNOWN:
+          default:
+            break;
+        }
+      }
+
+      vfloat32m8_t vres = __riscv_vle32_v_f32m8(temp_buf, vl);
+      __riscv_vse32_v_f32m8(x + i, vres, vl);
+    }
+    return;
+  }
+  #else
+
+  // Scalar Baseline Implementation
   for(int i = 0; i < size; i++) {
     float xv = x[i];
     switch (act_type) {
@@ -108,13 +163,11 @@ void apply_activate(float *x, int size, GPT2Activation act_type) {
         break;
       }
       case GPT2_ACTIVATION_GELU_NEW: {
-        // Approximation: 0.5 * xv * (1.0 + tanfp(sqrt(2/pi) * (xv + 0.044715 * xv^3))) or similar OpenAI gelu
         float inner = 0.7978845608f * (xv + 0.044715f * xv * xv * xv);
         x[i] = 0.5f * xv * (1.0f + tanhf(inner));
         break;
       }
       case GPT2_ACTIVATION_GELU_FAST: {
-        // Fast GELU approximation: x * sigmoid(1.702 * x) approx or similar
         x[i] = xv * (0.5f * (1.0f + tanhf(0.797885f * (xv + 0.044715f * xv * xv * xv))));
         break;
       }
@@ -122,7 +175,7 @@ void apply_activate(float *x, int size, GPT2Activation act_type) {
         x[i] = (xv > 0.0f) ? xv : 0.0f;
         break;
       }
-      case GPT2_ACTIVATION_SILU: { // Swish: x * sigmoid(x)
+      case GPT2_ACTIVATION_SILU: {
         x[i] = xv / (1.0f + expf(-xv));
         break;
       }
@@ -132,10 +185,10 @@ void apply_activate(float *x, int size, GPT2Activation act_type) {
       }
       case GPT2_ACTIVATION_UNKNOWN:
       default:
-        // Do nothing or fallback to GELU standard
         break;
     }
   }
+  #endif
 }
 
 void layernorm(float *out, float *x, float *g, float *b, float eps, int size) {
@@ -556,7 +609,7 @@ int main() {
   printf("MatMul:    %s\n", ENABLE_RVV_MATMUL ? "RVV" : "Scalar");
   printf("LayerNorm: %s\n", ENABLE_RVV_LAYERNORM ? "RVV" : "Scalar");
   printf("Add:       %s\n", ENABLE_RVV_ADD ? "RVV" : "Scalar");
-  printf("GELU:      %s\n", ENABLE_RVV_GELU ? "RVV" : "Scalar");
+  printf("GELU:      %s\n", ENABLE_RVV_ACTIVATION ? "RVV" : "Scalar");
   
   FILE *f = fopen("gpt2_weights.bin", "rb");
   if (!f) { printf("Error: gpt2_weights.bin not found\n"); return 1; }
