@@ -25,9 +25,6 @@
   #define HAS_RVV_HEADER 1
 #endif
 
-#define SQRT_2_PI 0.7978845608f
-#define C_GELU 0.044715f
-
 typedef struct {
   float *data;
   size_t pos, capacity;
@@ -109,27 +106,32 @@ typedef struct {
 
 
 /* KERNELS */
-void add(float *out, float *a, float *b, int size) {
-  int i;
-  #ifdef HAS_RVV_HEADER
-  if (ENABLE_RVV_ADD) {
-    size_t vl;
-    for (i = 0; i < size; i += vl) {
-      vl = __riscv_vsetvl_e32m8(size - i);
-      vfloat32m8_t va = __riscv_vle32_v_f32m8(a + i, vl);
-      vfloat32m8_t vb = __riscv_vle32_v_f32m8(b + i, vl);
-      vfloat32m8_t vres = __riscv_vfadd_vv_f32m8(va, vb, vl);
-      __riscv_vse32_v_f32m8(out + i, vres, vl);
-    }
-    return;
+int add(float *out, float *a, float *b, int size) {
+  if (out == NULL || a == NULL || b == NULL || size <= 0) {
+      return -1;
   }
-  #endif
+  int i;
+  #if defined(HAS_RVV_HEADER) && ENABLE_RVV_ADD
+  size_t vl;
+  for (i = 0; i < size; i += vl) {
+    vl = __riscv_vsetvl_e32m8(size - i);
+    vfloat32m8_t va = __riscv_vle32_v_f32m8(a + i, vl);
+    vfloat32m8_t vb = __riscv_vle32_v_f32m8(b + i, vl);
+    vfloat32m8_t vres = __riscv_vfadd_vv_f32m8(va, vb, vl);
+    __riscv_vse32_v_f32m8(out + i, vres, vl);
+  }
+  #else
   for(i = 0; i < size; i++) {
     out[i] = a[i] + b[i];
   }
+  #endif
+  return 0;
 }
 
-void apply_activate(float *x, int size, GPT2Activation act_type) {
+int apply_activate(float *x, int size, GPT2Activation act_type) {
+  if (x == NULL || size <= 0) {
+      return -1;
+  }
   int i;
   #if defined(HAS_RVV_HEADER) && ENABLE_RVV_ACTIVATION
   size_t vl;
@@ -148,8 +150,8 @@ void apply_activate(float *x, int size, GPT2Activation act_type) {
         float val = temp_buf[j];
         switch (act_type) {
           case GPT2_ACTIVATION_GELU: {
-            float cube = C_GELU * val * val * val;
-            float inner = SQRT_2_PI * (val + cube);
+            float cube = 0.044715f * val * val * val;
+            float inner = 0.7978845608f * (val + cube);
             temp_buf[j] = 0.5f * val * (1.0f + tanhf(inner));
             break;
           }
@@ -176,7 +178,7 @@ void apply_activate(float *x, int size, GPT2Activation act_type) {
           }
           case GPT2_ACTIVATION_UNKNOWN:
           default:
-            break;
+            return -1;
         }
       }
 
@@ -184,16 +186,14 @@ void apply_activate(float *x, int size, GPT2Activation act_type) {
       __riscv_vse32_v_f32m8(x + i, vres, vl);
     }
   }
-  return;
   #else
-
   /* Scalar Baseline Implementation */
   for(i = 0; i < size; i++) {
     float xv = x[i];
     switch (act_type) {
       case GPT2_ACTIVATION_GELU: {
-        float cube = C_GELU * xv * xv * xv;
-        float inner = SQRT_2_PI * (xv + cube);
+        float cube = 0.044715f * xv * xv * xv;
+        float inner = 0.7978845608f * (xv + cube);
         x[i] = 0.5f * xv * (1.0f + tanhf(inner));
         break;
       }
@@ -220,13 +220,17 @@ void apply_activate(float *x, int size, GPT2Activation act_type) {
       }
       case GPT2_ACTIVATION_UNKNOWN:
       default:
-        break;
+        return -1;
     }
   }
   #endif
+  return 0;
 }
 
-void layernorm(float *out, float *x, float *g, float *b, float eps, int size) {
+int layernorm(float *out, float *x, float *g, float *b, float eps, int size) {
+  if (out == NULL || x == NULL || g == NULL || b == NULL || size <= 0) {
+      return -1;
+  }
   int i;
   float mean, var, inv_std;
 
@@ -257,7 +261,9 @@ void layernorm(float *out, float *x, float *g, float *b, float eps, int size) {
       ptr += vl;
     }
     var = __riscv_vfmv_f_s_f32m1_f32(v_var) / size;
-    inv_std = 1.0f / sqrtf(var + eps);
+    float denom = var + eps;
+    if (denom <= 0.0f) return -1;
+    inv_std = 1.0f / sqrtf(denom);
 
     ptr = 0;
     while(ptr < size) {
@@ -287,14 +293,20 @@ void layernorm(float *out, float *x, float *g, float *b, float eps, int size) {
   }
   var /= size;
   
-  inv_std = 1.0f / sqrtf(var + eps);
+  float denom = var + eps;
+  if (denom <= 0.0f) return -1;
+  inv_std = 1.0f / sqrtf(denom);
   for(i = 0; i < size; i++) {
     out[i] = (x[i] - mean) * inv_std * g[i] + b[i];
   }
   #endif
+  return 0;
 }
 
-void matmul(float *out, float *x, float *w, float *b, int dim_in, int dim_out) {
+int matmul(float *out, float *x, float *w, float *b, int dim_in, int dim_out) {
+  if (out == NULL || x == NULL || w == NULL || dim_in <= 0 || dim_out <= 0) {
+      return -1;
+  }
   int i, j;
   #if defined(HAS_RVV_HEADER) && ENABLE_RVV_MATMUL
   size_t vl;
@@ -320,13 +332,17 @@ void matmul(float *out, float *x, float *w, float *b, int dim_in, int dim_out) {
     out[i] = val;
   }
   #endif
+  return 0;
 }
 
-void softmax(float *x, int n) {
+int softmax(float *x, int n) {
   int i;
-  float max_val = x[0];
+  float max_val, inv_sum;
   float sum = 0.0f;
-  float inv_sum;
+  if (x == NULL || n <= 0) {
+    return -1;
+  }
+  max_val = x[0];
 
   for (i = 1; i < n; i++) {
     if (x[i] > max_val) max_val = x[i];
@@ -335,25 +351,26 @@ void softmax(float *x, int n) {
     x[i] = expf(x[i] - max_val);
     sum += x[i];
   }
+  if (sum == 0.0f) return -1;
   inv_sum = 1.0f / sum;
   for (i = 0; i < n; i++) {
     x[i] *= inv_sum;
   }
+  return 0;
 }
 
-void attention(float *out, float *x, 
+int attention(float *out, float *x, 
                float *c_attn_w, float *c_attn_b, 
                float *c_proj_w, float *c_proj_b,
                GPT2State *state, GPT2Config *config, int layer, int pos) {
+  int h, n_embd, head_size;
+  float *q, *k, *v;
+  if (!out || !x || !state || !config) return -1;
 
-  int n_embd = config->n_embd;
-  int head_size = config->n_embd / config->n_head;
-  float *q;
-  float *k;
-  float *v;
-  int h;
+  n_embd = config->n_embd;
+  head_size = config->n_embd / config->n_head;
   
-  matmul(state->qkv, x, c_attn_w, c_attn_b, n_embd, 3 * n_embd);
+  if (matmul(state->qkv, x, c_attn_w, c_attn_b, n_embd, 3 * n_embd) != 0) return -1;
 
   q = state->qkv;
   k = state->qkv + n_embd;
@@ -385,7 +402,7 @@ void attention(float *out, float *x,
       scores[t] = score * scale;
     }
 
-    softmax(scores, pos + 1);
+    if (softmax(scores, pos + 1) != 0) return -1;
 
     head_out = state->attn_out + h * head_size;
     memset(head_out, 0, head_size * sizeof(float));
@@ -401,7 +418,7 @@ void attention(float *out, float *x,
     }
   }
 
-  matmul(out, state->attn_out, c_proj_w, c_proj_b, n_embd, n_embd);
+  return matmul(out, state->attn_out, c_proj_w, c_proj_b, n_embd, n_embd);
 }
 
 float fp16_to_fp32(uint16_t h) {
@@ -444,6 +461,8 @@ int tensor_to_float(FloatBuffer *buf, const GPT2Tensor *tensor, float **out, int
   int i;
   size_t required_pos;
 
+  if (!buf || !tensor || !out) return -1;
+
   for (i = 0; i < tensor->ndim; i++) {
     total_elements *= tensor->shape[i];
   }
@@ -473,6 +492,7 @@ int tensor_to_float(FloatBuffer *buf, const GPT2Tensor *tensor, float **out, int
     case GPT2_DTYPE_I32: {
       int i;
       int32_t *src = (int32_t *)tensor->data;
+      if (!src) return -1;
       for (i = 0; i < total_elements; i++) {
         (*out)[i] = (float)src[i];
       }
@@ -481,6 +501,7 @@ int tensor_to_float(FloatBuffer *buf, const GPT2Tensor *tensor, float **out, int
     case GPT2_DTYPE_I64: {
       int i;
       int64_t *src = (int64_t *)tensor->data;
+      if (!src) return -1;
       for (i = 0; i < total_elements; i++) {
         (*out)[i] = (float)src[i];
       }
@@ -489,6 +510,7 @@ int tensor_to_float(FloatBuffer *buf, const GPT2Tensor *tensor, float **out, int
     case GPT2_DTYPE_F16: {
       int i;
       uint16_t *src = (uint16_t *)tensor->data;
+      if (!src) return -1;
       for (i = 0; i < total_elements; i++) {
         (*out)[i] = fp16_to_fp32(src[i]);
       }
@@ -497,6 +519,7 @@ int tensor_to_float(FloatBuffer *buf, const GPT2Tensor *tensor, float **out, int
     case GPT2_DTYPE_BF16: {
       int i;
       uint16_t *src = (uint16_t *)tensor->data;
+      if (!src) return -1;
       for (i = 0; i < total_elements; i++) {
         (*out)[i] = bf16_to_fp32(src[i]);
       }
@@ -509,48 +532,50 @@ int tensor_to_float(FloatBuffer *buf, const GPT2Tensor *tensor, float **out, int
   return 0;
 }
 
-void transformer_block(float *x, GPT2Weights *w, GPT2State *s, GPT2Config *config, int layer, int pos) {
+int transformer_block(float *x, GPT2Weights *w, GPT2State *s, GPT2Config *config, int layer, int pos) {
+  if (!x || !w || !s || !config) return -1;
+
   int n_embd = config->n_embd;
   float *w_ptr1, *w_ptr2, *w_ptr3, *w_ptr4;
   memcpy(s->resid, x, n_embd * sizeof(float));
 
-  tensor_to_float(&s->buf, &w->layers[layer].ln1_w, &w_ptr1, NULL);
-  tensor_to_float(&s->buf, &w->layers[layer].ln1_b, &w_ptr2, NULL);
+  if (tensor_to_float(&s->buf, &w->layers[layer].ln1_w, &w_ptr1, NULL) != 0) return -1;
+  if (tensor_to_float(&s->buf, &w->layers[layer].ln1_b, &w_ptr2, NULL) != 0) return -1;
 
-  layernorm(s->ln1_out, x, w_ptr1, w_ptr2, config->layer_norm_epsilon, n_embd);
+  if (layernorm(s->ln1_out, x, w_ptr1, w_ptr2, config->layer_norm_epsilon, n_embd) != 0) return -1;
   s->buf.pos = 0;
 
-  tensor_to_float(&s->buf, &w->layers[layer].attn_w, &w_ptr1, NULL);
-  tensor_to_float(&s->buf, &w->layers[layer].attn_b, &w_ptr2, NULL);
-  tensor_to_float(&s->buf, &w->layers[layer].attn_proj_w, &w_ptr3, NULL);
-  tensor_to_float(&s->buf, &w->layers[layer].attn_proj_b, &w_ptr4, NULL);
+  if (tensor_to_float(&s->buf, &w->layers[layer].attn_w, &w_ptr1, NULL) != 0) return -1;
+  if (tensor_to_float(&s->buf, &w->layers[layer].attn_b, &w_ptr2, NULL) != 0) return -1;
+  if (tensor_to_float(&s->buf, &w->layers[layer].attn_proj_w, &w_ptr3, NULL) != 0) return -1;
+  if (tensor_to_float(&s->buf, &w->layers[layer].attn_proj_b, &w_ptr4, NULL) != 0) return -1;
 
-  attention(s->attn_out, s->ln1_out, w_ptr1, w_ptr2, 
-            w_ptr3, w_ptr4, s, config, layer, pos);
+  if (attention(s->attn_out, s->ln1_out, w_ptr1, w_ptr2, 
+            w_ptr3, w_ptr4, s, config, layer, pos) != 0) return -1;
   s->buf.pos = 0;
   
-  add(x, s->resid, s->attn_out, n_embd);
+  if (add(x, s->resid, s->attn_out, n_embd) != 0) return -1;
   memcpy(s->resid, x, n_embd * sizeof(float));
 
-  tensor_to_float(&s->buf, &w->layers[layer].ln2_w, &w_ptr1, NULL);
-  tensor_to_float(&s->buf, &w->layers[layer].ln2_b, &w_ptr2, NULL);
-  layernorm(s->ln2_out, x, w_ptr1, w_ptr2, config->layer_norm_epsilon, n_embd);
+  if (tensor_to_float(&s->buf, &w->layers[layer].ln2_w, &w_ptr1, NULL) != 0) return -1;
+  if (tensor_to_float(&s->buf, &w->layers[layer].ln2_b, &w_ptr2, NULL) != 0) return -1;
+  if (layernorm(s->ln2_out, x, w_ptr1, w_ptr2, config->layer_norm_epsilon, n_embd) != 0) return -1;
   s->buf.pos = 0;
 
-  tensor_to_float(&s->buf, &w->layers[layer].mlp_fc_w, &w_ptr1, NULL);
-  tensor_to_float(&s->buf, &w->layers[layer].mlp_fc_b, &w_ptr2, NULL);
-  matmul(s->mlp_hidden, s->ln2_out, w_ptr1, w_ptr2, n_embd, 4 * n_embd);
+  if (tensor_to_float(&s->buf, &w->layers[layer].mlp_fc_w, &w_ptr1, NULL) != 0) return -1;
+  if (tensor_to_float(&s->buf, &w->layers[layer].mlp_fc_b, &w_ptr2, NULL) != 0) return -1;
+  if (matmul(s->mlp_hidden, s->ln2_out, w_ptr1, w_ptr2, n_embd, 4 * n_embd) != 0) return -1;
   s->buf.pos = 0;
   
-  apply_activate(s->mlp_hidden, 4 * n_embd, config->activation_type);
-  tensor_to_float(&s->buf, &w->layers[layer].mlp_proj_w, &w_ptr1, NULL);
-  tensor_to_float(&s->buf, &w->layers[layer].mlp_proj_b, &w_ptr2, NULL);
-  matmul(s->mlp_out, s->mlp_hidden, w_ptr1, w_ptr2, 4 * n_embd, n_embd);
+  if (apply_activate(s->mlp_hidden, 4 * n_embd, config->activation_type) != 0) return -1;
+  if (tensor_to_float(&s->buf, &w->layers[layer].mlp_proj_w, &w_ptr1, NULL) != 0) return -1;
+  if (tensor_to_float(&s->buf, &w->layers[layer].mlp_proj_b, &w_ptr2, NULL) != 0) return -1;
+  if (matmul(s->mlp_out, s->mlp_hidden, w_ptr1, w_ptr2, 4 * n_embd, n_embd) != 0) return -1;
 
-  add(x, s->resid, s->mlp_out, n_embd);
+  return add(x, s->resid, s->mlp_out, n_embd);
 }
 
-void GPT2Config_init(GPT2Config *config) {
+int GPT2Config_init(GPT2Config *config) {
   if (config) {
     config->n_layer = 12;
     config->n_embd = 768;
@@ -566,10 +591,12 @@ void GPT2Config_init(GPT2Config *config) {
     config->eos_token_id = 50256;
     config->pad_token_id = 50256;
     config->unk_token_id = 50256;
+    return 0;
   }
+  return -1;
 }
 
-void GPT2State_init(GPT2State *state, GPT2Config *config) {
+int GPT2State_init(GPT2State *state, GPT2Config *config) {
   if (state && config) {
     long cache_size = (long)config->n_layer * config->n_positions * config->n_embd; 
     state->key_cache = (float*)malloc(cache_size * sizeof(float));
@@ -594,15 +621,16 @@ void GPT2State_init(GPT2State *state, GPT2Config *config) {
       !state->ln1_out || !state->ln2_out || !state->mlp_hidden || !state->mlp_out
     ) {
       fprintf(stderr, "Error: Memory allocation failed in GPT2State_init\n");
-      exit(EXIT_FAILURE);
+      return -1;
     }
+    return 0;
   } else {
-    exit(EXIT_FAILURE);
+    return -1;
   }
 }
 
-void GPT2State_free(GPT2State *state) {
-  if (!state) return;
+int GPT2State_free(GPT2State *state) {
+  if (!state) return -1;
   if (state->key_cache) { free(state->key_cache); state->key_cache = NULL; }
   if (state->value_cache) { free(state->value_cache); state->value_cache = NULL; }
   if (state->x) { free(state->x); state->x = NULL; }
@@ -621,6 +649,7 @@ void GPT2State_free(GPT2State *state) {
     state->buf.pos = 0;
     state->buf.capacity = 0;
   }
+  return 0;
 }
 
 typedef struct {
@@ -649,6 +678,7 @@ float random_f32(void) {
 }
 
 int sample(float *logits, int vocab_size, float temperature, int top_k, float top_p, TokenProbability *vocab_probs) {
+  if (!logits || vocab_size <= 0 || !vocab_probs) return -1;
   int i;
   float max_val;
   float sum;
@@ -684,6 +714,7 @@ int sample(float *logits, int vocab_size, float temperature, int top_k, float to
     logits[i] = expf(logits[i] - max_val);
     sum += logits[i];
   }
+  if (sum == 0.0f) return -1;
   inv_sum = 1.0f / sum;
   for (i = 0; i < vocab_size; i++) {
     logits[i] *= inv_sum;
@@ -742,9 +773,14 @@ typedef struct {
   unsigned long long seed;
 } GPT2Param;
 
-void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
+int generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
   GPT2State *state, int *prompt_tokens, int num_prompt,
   TokenProbability *vocab_probs, int **tokens, int *token_len) {
+  if (!w || !config || !param || !state || !prompt_tokens || !tokens || !token_len || num_prompt <= 0) {
+      if (token_len) *token_len = 0;
+      return -1;
+  }
+
   float *wte_ptr, *wpe_ptr, *ln_f_w_ptr, *ln_f_b_ptr, *lm_head_ptr;
   int current_token = prompt_tokens[0];
   int pos = 0;
@@ -755,17 +791,17 @@ void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
   if (!(*tokens)) {
     fprintf(stderr, "Error: Memory allocation failed for tokens in generate\n");
     *token_len = 0;
-    return;
+    return -1;
   }
 
-  tensor_to_float(&state->buf, &w->wte, &wte_ptr, NULL);
-  tensor_to_float(&state->buf, &w->wpe, &wpe_ptr, NULL);
-  tensor_to_float(&state->buf, &w->ln_f_w, &ln_f_w_ptr, NULL);
-  tensor_to_float(&state->buf, &w->ln_f_b, &ln_f_b_ptr, NULL);
+  if (tensor_to_float(&state->buf, &w->wte, &wte_ptr, NULL) != 0) return -1;
+  if (tensor_to_float(&state->buf, &w->wpe, &wpe_ptr, NULL) != 0) return -1;
+  if (tensor_to_float(&state->buf, &w->ln_f_w, &ln_f_w_ptr, NULL) != 0) return -1;
+  if (tensor_to_float(&state->buf, &w->ln_f_b, &ln_f_b_ptr, NULL) != 0) return -1;
   if (config->tie_word_embeddings) {
     lm_head_ptr = wte_ptr;
   } else {
-    tensor_to_float(&state->buf, &w->lm_head, &lm_head_ptr, NULL);
+    if (tensor_to_float(&state->buf, &w->lm_head, &lm_head_ptr, NULL) != 0) return -1;
   }
   while (pos < num_prompt + param->max_gen_tokens) {
     int i;
@@ -776,16 +812,18 @@ void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
     }
 
     for(i = 0; i < config->n_layer; i++) {
-      transformer_block(state->x, w, state, config, i, pos);
+      if (transformer_block(state->x, w, state, config, i, pos) != 0) return -1;
     }
 
-    layernorm(state->final, state->x, ln_f_w_ptr, ln_f_b_ptr, config->layer_norm_epsilon, config->n_embd);
+    if (layernorm(state->final, state->x, ln_f_w_ptr, ln_f_b_ptr, config->layer_norm_epsilon, config->n_embd) != 0) return -1;
 
     if (pos < num_prompt - 1) {
       next_token = prompt_tokens[pos + 1];
     } else {
-      matmul(state->logits, state->final, lm_head_ptr, NULL, config->n_embd, config->vocab_size);
-      next_token = sample(state->logits, config->vocab_size, param->temperature, param->top_k, param->top_p, vocab_probs);
+      if (matmul(state->logits, state->final, lm_head_ptr, NULL, config->n_embd, config->vocab_size) != 0) return -1;
+      int sample_res = sample(state->logits, config->vocab_size, param->temperature, param->top_k, param->top_p, vocab_probs);
+      if (sample_res < 0) return -1;
+      next_token = sample_res;
       printf("Step %d | Token: %d\n", pos, next_token);
       if (next_token == config->eos_token_id) {
         printf("EOS token (%d), stoped.\n", config->eos_token_id);
@@ -805,6 +843,7 @@ void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
     if (pos >= config->n_positions) break;
   }
   *token_len = count;
+  return 0;
 }
 
 int main(void) {
