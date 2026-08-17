@@ -65,6 +65,7 @@ typedef struct {
   GPT2Activation activation_type;
   int scale_attn_weights;
   int tie_word_embeddings;
+  int bos_token_id, eos_token_id, pad_token_id, unk_token_id;
 } GPT2Config;
 
 typedef struct {
@@ -560,6 +561,11 @@ void GPT2Config_init(GPT2Config *config) {
     config->activation_type = GPT2_ACTIVATION_GELU;
     config->scale_attn_weights = 1;
     config->tie_word_embeddings = 1;
+
+    config->bos_token_id = 50256;
+    config->eos_token_id = 50256;
+    config->pad_token_id = 50256;
+    config->unk_token_id = 50256;
   }
 }
 
@@ -771,6 +777,10 @@ void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
       matmul(state->logits, state->final, lm_head_ptr, NULL, config->n_embd, config->vocab_size);
       next_token = sample(state->logits, config->vocab_size, param->temperature, param->top_k, param->top_p, vocab_probs);
       printf("Step %d | Token: %d\n", pos, next_token);
+      if (next_token == config->eos_token_id) {
+        printf("EOS token (%d), stoped.\n", config->eos_token_id);
+        break;
+      }
     }
 
     pos++;
