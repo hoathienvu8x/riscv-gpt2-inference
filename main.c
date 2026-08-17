@@ -50,49 +50,8 @@ typedef struct {
 
 
 /* SCALAR KERNELS (BASELINE) */
-void add_scalar(float *out, float *a, float *b, int size) {
-  for(int i=0; i<size; i++) out[i] = a[i] + b[i];
-}
-
-void gelu_scalar(float *x, int size) {
-  for(int i=0; i<size; i++) {
-    float xv = x[i];
-    float cube = C_GELU * xv * xv * xv;
-    float inner = SQRT_2_PI * (xv + cube);
-    x[i] = 0.5f * xv * (1.0f + tanhf(inner));
-  }
-}
-
-void layernorm_scalar(float *out, float *x, float *g, float *b, int size) {
-  float mean = 0.0f;
-  for(int i=0; i<size; i++) mean += x[i];
-  mean /= size;
-  
-  float var = 0.0f;
-  for(int i=0; i<size; i++) var += (x[i] - mean) * (x[i] - mean);
-  var /= size;
-  
-  float inv_std = 1.0f / sqrtf(var + EPS);
-  for(int i=0; i<size; i++) {
-    out[i] = (x[i] - mean) * inv_std * g[i] + b[i];
-  }
-}
-
-void matmul_scalar(float *out, float *x, float *w, float *b, int dim_in, int dim_out) {
-  for (int i = 0; i < dim_out; i++) {
-    float val = (b != NULL) ? b[i] : 0.0f;
-    for (int j = 0; j < dim_in; j++) {
-      val += x[j] * w[j * dim_out + i];
-    }
-    out[i] = val;
-  }
-}
-
-
-/*/ RISC-V VECTOR KERNELS */
-#ifdef HAS_RVV_HEADER
-
-void add_rvv(float *out, float *a, float *b, int size) {
+void add(float *out, float *a, float *b, int size) {
+  #ifdef HAS_RVV_HEADER
   size_t vl;
   for (int i = 0; i < size; i += vl) {
     vl = __riscv_vsetvl_e32m8(size - i);
@@ -101,9 +60,22 @@ void add_rvv(float *out, float *a, float *b, int size) {
     vfloat32m8_t vres = __riscv_vfadd_vv_f32m8(va, vb, vl);
     __riscv_vse32_v_f32m8(out + i, vres, vl);
   }
+  #else
+  for(int i=0; i<size; i++) out[i] = a[i] + b[i];
+  #endif
 }
 
-void layernorm_rvv(float *out, float *x, float *g, float *b, int size) {
+void gelu(float *x, int size) {
+  for(int i=0; i<size; i++) {
+    float xv = x[i];
+    float cube = C_GELU * xv * xv * xv;
+    float inner = SQRT_2_PI * (xv + cube);
+    x[i] = 0.5f * xv * (1.0f + tanhf(inner));
+  }
+}
+
+void layernorm(float *out, float *x, float *g, float *b, int size) {
+  #ifdef HAS_RVV_HEADER
   size_t vl;
   /* Mean */
   vfloat32m1_t v_sum = __riscv_vfmv_v_f_f32m1(0.0f, 1);
@@ -145,9 +117,24 @@ void layernorm_rvv(float *out, float *x, float *g, float *b, int size) {
     __riscv_vse32_v_f32m8(out + ptr, v_norm, vl);
     ptr += vl;
   }
+  #else
+  float mean = 0.0f;
+  for(int i=0; i<size; i++) mean += x[i];
+  mean /= size;
+  
+  float var = 0.0f;
+  for(int i=0; i<size; i++) var += (x[i] - mean) * (x[i] - mean);
+  var /= size;
+  
+  float inv_std = 1.0f / sqrtf(var + EPS);
+  for(int i=0; i<size; i++) {
+    out[i] = (x[i] - mean) * inv_std * g[i] + b[i];
+  }
+  #endif
 }
 
-void matmul_rvv(float *out, float *x, float *w, float *b, int dim_in, int dim_out) {
+void matmul(float *out, float *x, float *w, float *b, int dim_in, int dim_out) {
+  #ifdef HAS_RVV_HEADER
   size_t vl;
   for (int i = 0; i < dim_out; i += vl) {
     vl = __riscv_vsetvl_e32m8(dim_out - i);
@@ -162,34 +149,33 @@ void matmul_rvv(float *out, float *x, float *w, float *b, int dim_in, int dim_ou
     }
     __riscv_vse32_v_f32m8(out + i, v_acc, vl);
   }
+  #else
+  for (int i = 0; i < dim_out; i++) {
+    float val = (b != NULL) ? b[i] : 0.0f;
+    for (int j = 0; j < dim_in; j++) {
+      val += x[j] * w[j * dim_out + i];
+    }
+    out[i] = val;
+  }
+  #endif
 }
-#endif
-
 
 /* Mapping */
 #if ENABLE_RVV_MATMUL
-  #define MATMUL matmul_rvv
   const char* MODE_MATMUL = "RVV";
 #else
-  #define MATMUL matmul_scalar
   const char* MODE_MATMUL = "Scalar";
 #endif
 
 #if ENABLE_RVV_LAYERNORM
-  #define LAYERNORM layernorm_rvv
   const char* MODE_LN = "RVV";
 #else
-  #define LAYERNORM layernorm_scalar
   const char* MODE_LN = "Scalar";
 #endif
 
-#define GELU gelu_scalar
-
 #if ENABLE_RVV_ADD
-  #define ADD add_rvv
   const char* MODE_ADD = "RVV";
 #else
-  #define ADD add_scalar
   const char* MODE_ADD = "Scalar";
 #endif
 
@@ -212,7 +198,7 @@ void attention(float *out, float *x,
     
   /* 1. QKV Projection (Mapped) */
   float qkv[3 * D_MODEL]; 
-  MATMUL(qkv, x, c_attn_w, c_attn_b, D_MODEL, 3 * D_MODEL);
+  matmul(qkv, x, c_attn_w, c_attn_b, D_MODEL, 3 * D_MODEL);
 
   float *q = qkv;
   float *k = qkv + D_MODEL;
@@ -270,7 +256,7 @@ void attention(float *out, float *x,
   }
 
   /* 3. Output Projection (Mapped) */
-  MATMUL(out, att_out, c_proj_w, c_proj_b, D_MODEL, D_MODEL);
+  matmul(out, att_out, c_proj_w, c_proj_b, D_MODEL, D_MODEL);
 }
 
 void transformer_block(float *x, GPT2Weights *w, GPT2State *s, int layer, int pos) {
@@ -279,7 +265,7 @@ void transformer_block(float *x, GPT2Weights *w, GPT2State *s, int layer, int po
 
   /* LN 1 */
   float ln1[D_MODEL];
-  LAYERNORM(ln1, x, w->ln1_w[layer], w->ln1_b[layer], D_MODEL);
+  layernorm(ln1, x, w->ln1_w[layer], w->ln1_b[layer], D_MODEL);
 
   /* Attention */
   float attn_out[D_MODEL];
@@ -287,26 +273,26 @@ void transformer_block(float *x, GPT2Weights *w, GPT2State *s, int layer, int po
             w->attn_proj_w[layer], w->attn_proj_b[layer], s, layer, pos);
   
   /* Resid 1 */
-  ADD(x, resid, attn_out, D_MODEL);
+  add(x, resid, attn_out, D_MODEL);
   memcpy(resid, x, D_MODEL * sizeof(float));
 
   /* LN 2 */
   float ln2[D_MODEL];
-  LAYERNORM(ln2, x, w->ln2_w[layer], w->ln2_b[layer], D_MODEL);
+  layernorm(ln2, x, w->ln2_w[layer], w->ln2_b[layer], D_MODEL);
 
   /* MLP FC */
   float mlp_hidden[4 * D_MODEL];
-  MATMUL(mlp_hidden, ln2, w->mlp_fc_w[layer], w->mlp_fc_b[layer], D_MODEL, 4 * D_MODEL);
+  matmul(mlp_hidden, ln2, w->mlp_fc_w[layer], w->mlp_fc_b[layer], D_MODEL, 4 * D_MODEL);
   
   /* GELU */
-  GELU(mlp_hidden, 4 * D_MODEL);
+  gelu(mlp_hidden, 4 * D_MODEL);
   
   /* MLP Proj */
   float mlp_out[D_MODEL];
-  MATMUL(mlp_out, mlp_hidden, w->mlp_proj_w[layer], w->mlp_proj_b[layer], 4 * D_MODEL, D_MODEL);
+  matmul(mlp_out, mlp_hidden, w->mlp_proj_w[layer], w->mlp_proj_b[layer], 4 * D_MODEL, D_MODEL);
 
   /* Resid 2 */
-  ADD(x, resid, mlp_out, D_MODEL);
+  add(x, resid, mlp_out, D_MODEL);
 }
 
 int main() {
@@ -383,7 +369,7 @@ int main() {
 
     /* Final Norm */
     float final_norm[D_MODEL];
-    LAYERNORM(final_norm, x, w.ln_f_w, w.ln_f_b, D_MODEL);
+    layernorm(final_norm, x, w.ln_f_w, w.ln_f_b, D_MODEL);
 
     /* Next Token Logic */
     int next_token;
@@ -391,7 +377,7 @@ int main() {
       next_token = prompt_tokens[pos + 1];
     } else {
       /* Logits */
-      MATMUL(logits, final_norm, w.lm_head, NULL, D_MODEL, VOCAB_SIZE);
+      matmul(logits, final_norm, w.lm_head, NULL, D_MODEL, VOCAB_SIZE);
       
       float max_prob = -1e9;
       int argmax = 0;
