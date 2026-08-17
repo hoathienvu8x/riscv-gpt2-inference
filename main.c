@@ -19,16 +19,13 @@
   #define HAS_RVV_HEADER 1
 #endif
 
-#define N_LAYERS 12
-#define D_MODEL 768
-#define N_HEADS 12
-#define HEAD_SIZE 64   /* 768 / 12 */
-#define VOCAB_SIZE 50257
-#define MAX_SEQ_LEN 1024
-#define EPS 1e-5f
-
 #define SQRT_2_PI 0.7978845608f
 #define C_GELU 0.044715f
+
+typedef struct {
+  int vocab_size, n_positions, n_embd, n_layer, n_head;
+  double layer_norm_epsilon;
+} GPT2Config;
 
 typedef struct {
   float *ln1_w, *ln1_b;
@@ -42,7 +39,7 @@ typedef struct {
 typedef struct {
   float *wte; /* [VOCAB, D_MODEL] */
   float *wpe; /* [MAX_SEQ, D_MODEL] */
-  GPT2Layers layers[N_LAYERS];
+  GPT2Layers *layers;
   float *ln_f_w, *ln_f_b;
   float *lm_head;
 } GPT2Weights;
@@ -94,7 +91,7 @@ void gelu(float *x, int size) {
   }
 }
 
-void layernorm(float *out, float *x, float *g, float *b, int size) {
+void layernorm(float *out, float *x, float *g, float *b, float eps, int size) {
   #ifdef HAS_RVV_HEADER
   size_t vl;
   /* Mean */
@@ -120,7 +117,7 @@ void layernorm(float *out, float *x, float *g, float *b, int size) {
     ptr += vl;
   }
   float var = __riscv_vfmv_f_s_f32m1_f32(v_var) / size;
-  float inv_std = 1.0f / sqrtf(var + EPS);
+  float inv_std = 1.0f / sqrtf(var + eps);
 
   /* Normalize */
   ptr = 0;
@@ -146,7 +143,7 @@ void layernorm(float *out, float *x, float *g, float *b, int size) {
   for(int i=0; i<size; i++) var += (x[i] - mean) * (x[i] - mean);
   var /= size;
   
-  float inv_std = 1.0f / sqrtf(var + EPS);
+  float inv_std = 1.0f / sqrtf(var + eps);
   for(int i=0; i<size; i++) {
     out[i] = (x[i] - mean) * inv_std * g[i] + b[i];
   }
@@ -214,28 +211,30 @@ void softmax(float *x, int n) {
 void attention(float *out, float *x, 
                float *c_attn_w, float *c_attn_b, 
                float *c_proj_w, float *c_proj_b,
-               GPT2State *state, int layer, int pos) {
-    
+               GPT2State *state, GPT2Config *config, int layer, int pos) {
+
+  int n_embd = config->n_embd;
+  int head_size = config->n_embd / config->n_head;
   /* 1. QKV Projection (Mapped) */
-  matmul(state->qkv, x, c_attn_w, c_attn_b, D_MODEL, 3 * D_MODEL);
+  matmul(state->qkv, x, c_attn_w, c_attn_b, n_embd, 3 * n_embd);
 
   float *q = state->qkv;
-  float *k = state->qkv + D_MODEL;
-  float *v = state->qkv + 2 * D_MODEL;
+  float *k = state->qkv + n_embd;
+  float *v = state->qkv + 2 * n_embd;
 
   /* 2. Multi-Head Attention Loop */
-  for (int h = 0; h < N_HEADS; h++) {
-    float *head_q = q + h * HEAD_SIZE;
+  for (int h = 0; h < config->n_head; h++) {
+    float *head_q = q + h * head_size;
     
-    int cache_offset = layer * (N_HEADS * MAX_SEQ_LEN * HEAD_SIZE) + 
-                       h * (MAX_SEQ_LEN * HEAD_SIZE) + 
-                       pos * HEAD_SIZE;
+    int cache_offset = layer * (config->n_head * config->n_positions * head_size) + 
+                       h * (config->n_positions * head_size) + 
+                       pos * head_size;
     
     float *cache_k = state->key_cache + cache_offset;
     float *cache_v = state->value_cache + cache_offset;
 
-    memcpy(cache_k, k + h * HEAD_SIZE, HEAD_SIZE * sizeof(float));
-    memcpy(cache_v, v + h * HEAD_SIZE, HEAD_SIZE * sizeof(float));
+    memcpy(cache_k, k + h * head_size, head_size * sizeof(float));
+    memcpy(cache_v, v + h * head_size, head_size * sizeof(float));
 
     float *scores = state->att_scores; 
     
@@ -245,83 +244,91 @@ void attention(float *out, float *x,
        For this demo, we keep it manual/scalar loop to focus on the big kernels.
      */
     for (int t = 0; t <= pos; t++) {
-      int past_offset = layer * (N_HEADS * MAX_SEQ_LEN * HEAD_SIZE) + 
-                        h * (MAX_SEQ_LEN * HEAD_SIZE) + 
-                        t * HEAD_SIZE;
+      int past_offset = layer * (config->n_head * config->n_positions * head_size) + 
+                        h * (config->n_positions * head_size) + 
+                        t * head_size;
       float *past_k = state->key_cache + past_offset;
 
       float score = 0.0f;
-      for (int i = 0; i < HEAD_SIZE; i++) score += head_q[i] * past_k[i];
-      score /= sqrtf((float)HEAD_SIZE);
+      for (int i = 0; i < head_size; i++) score += head_q[i] * past_k[i];
+      score /= sqrtf((float)head_size);
       scores[t] = score;
     }
 
     softmax(scores, pos + 1);
 
     /* --- WEIGHTED SUM --- */
-    float *head_out = state->attn_out + h * HEAD_SIZE;
-    for (int i = 0; i < HEAD_SIZE; i++) head_out[i] = 0.0f;
+    float *head_out = state->attn_out + h * head_size;
+    for (int i = 0; i < head_size; i++) head_out[i] = 0.0f;
 
     for (int t = 0; t <= pos; t++) {
-      int past_offset = layer * (N_HEADS * MAX_SEQ_LEN * HEAD_SIZE) + 
-                        h * (MAX_SEQ_LEN * HEAD_SIZE) + 
-                        t * HEAD_SIZE;
+      int past_offset = layer * (config->n_head * config->n_positions * head_size) + 
+                        h * (config->n_positions * head_size) + 
+                        t * head_size;
       float *past_v = state->value_cache + past_offset;
       float prob = scores[t];
-      for (int i = 0; i < HEAD_SIZE; i++) head_out[i] += prob * past_v[i];
+      for (int i = 0; i < head_size; i++) head_out[i] += prob * past_v[i];
     }
   }
 
   /* 3. Output Projection (Mapped) */
-  matmul(out, state->attn_out, c_proj_w, c_proj_b, D_MODEL, D_MODEL);
+  matmul(out, state->attn_out, c_proj_w, c_proj_b, n_embd, n_embd);
 }
 
-void transformer_block(float *x, GPT2Weights *w, GPT2State *s, int layer, int pos) {
-  memcpy(s->resid, x, D_MODEL * sizeof(float));
+void transformer_block(float *x, GPT2Weights *w, GPT2State *s, GPT2Config *config, int layer, int pos) {
+  int n_embd = config->n_embd;
+  memcpy(s->resid, x, n_embd * sizeof(float));
 
   /* LN 1 */
-  layernorm(s->ln1_out, x, w->layers[layer].ln1_w, w->layers[layer].ln1_b, D_MODEL);
+  layernorm(s->ln1_out, x, w->layers[layer].ln1_w, w->layers[layer].ln1_b, config->layer_norm_epsilon, n_embd);
 
   /* Attention */
-  float attn_out[D_MODEL];
   attention(s->attn_out, s->ln1_out, w->layers[layer].attn_w, w->layers[layer].attn_b, 
-            w->layers[layer].attn_proj_w, w->layers[layer].attn_proj_b, s, layer, pos);
+            w->layers[layer].attn_proj_w, w->layers[layer].attn_proj_b, s, config, layer, pos);
   
   /* Resid 1 */
-  add(x, s->resid, s->attn_out, D_MODEL);
-  memcpy(s->resid, x, D_MODEL * sizeof(float));
+  add(x, s->resid, s->attn_out, n_embd);
+  memcpy(s->resid, x, n_embd * sizeof(float));
 
   /* LN 2 */
-  layernorm(s->ln2_out, x, w->layers[layer].ln2_w, w->layers[layer].ln2_b, D_MODEL);
+  layernorm(s->ln2_out, x, w->layers[layer].ln2_w, w->layers[layer].ln2_b, config->layer_norm_epsilon, n_embd);
 
   /* MLP FC */
-  matmul(s->mlp_hidden, s->ln2_out, w->layers[layer].mlp_fc_w, w->layers[layer].mlp_fc_b, D_MODEL, 4 * D_MODEL);
+  matmul(s->mlp_hidden, s->ln2_out, w->layers[layer].mlp_fc_w, w->layers[layer].mlp_fc_b, n_embd, 4 * n_embd);
   
   /* GELU */
-  gelu(s->mlp_hidden, 4 * D_MODEL);
+  gelu(s->mlp_hidden, 4 * n_embd);
   
   /* MLP Proj */
-  float mlp_out[D_MODEL];
-  matmul(s->mlp_out, s->mlp_hidden, w->layers[layer].mlp_proj_w, w->layers[layer].mlp_proj_b, 4 * D_MODEL, D_MODEL);
+  matmul(s->mlp_out, s->mlp_hidden, w->layers[layer].mlp_proj_w, w->layers[layer].mlp_proj_b, 4 * n_embd, n_embd);
 
   /* Resid 2 */
-  add(x, s->resid, s->mlp_out, D_MODEL);
+  add(x, s->resid, s->mlp_out, n_embd);
 }
 
-void GPT2State_init(GPT2State *state) {
-  long cache_size = (long)N_LAYERS * MAX_SEQ_LEN * D_MODEL; 
+void GPT2Config_init(GPT2Config *config) {
+  config->n_layer = 12;
+  config->n_embd = 768;
+  config->n_head = 12;
+  config->vocab_size = 50257;
+  config->n_positions = 1024;
+  config->layer_norm_epsilon = 1e-5f;
+}
+
+void GPT2State_init(GPT2State *state, GPT2Config *config) {
+  long cache_size = (long)config->n_layer * config->n_positions * config->n_embd; 
   state->key_cache = (float*)malloc(cache_size * sizeof(float));
   state->value_cache = (float*)malloc(cache_size * sizeof(float));
-  state->x = (float *)malloc(D_MODEL * sizeof(float));
-  state->logits = (float *)malloc(VOCAB_SIZE * sizeof(float));
-  state->final = (float *)malloc(D_MODEL * sizeof(float));
-  state->qkv = (float *)malloc(3 * D_MODEL * sizeof(float));
-  state->att_scores = (float *)malloc(MAX_SEQ_LEN * sizeof(float));
-  state->attn_out = (float *)malloc(D_MODEL * sizeof(float));
-  state->ln1_out = (float *)malloc(D_MODEL * sizeof(float));
-  state->ln2_out = (float *)malloc(D_MODEL * sizeof(float));
-  state->mlp_hidden = (float *)malloc(4 * D_MODEL * sizeof(float));
-  state->mlp_out = (float *)malloc(D_MODEL * sizeof(float));  
+  state->x = (float *)malloc(config->n_embd * sizeof(float));
+  state->logits = (float *)malloc(config->vocab_size * sizeof(float));
+  state->final = (float *)malloc(config->n_embd * sizeof(float));
+  state->qkv = (float *)malloc(3 * config->n_embd * sizeof(float));
+  state->att_scores = (float *)malloc(config->n_positions * sizeof(float));
+  state->attn_out = (float *)malloc(config->n_embd * sizeof(float));
+  state->ln1_out = (float *)malloc(config->n_embd * sizeof(float));
+  state->ln2_out = (float *)malloc(config->n_embd * sizeof(float));
+  state->mlp_hidden = (float *)malloc(4 * config->n_embd * sizeof(float));
+  state->mlp_out = (float *)malloc(config->n_embd * sizeof(float));  
 }
 
 void GPT2State_free(GPT2State *state) {
@@ -360,29 +367,32 @@ int main() {
   fclose(f);
 
   GPT2Weights w;
+  GPT2Config config;
   float *ptr = memory;
-  w.wte = ptr; ptr += VOCAB_SIZE * D_MODEL;
-  w.wpe = ptr; ptr += MAX_SEQ_LEN * D_MODEL;
-  for (int i = 0; i < N_LAYERS; i++) {
-    w.layers[i].ln1_w = ptr; ptr += D_MODEL;
-    w.layers[i].ln1_b = ptr; ptr += D_MODEL;
-    w.layers[i].attn_w = ptr; ptr += D_MODEL * 3 * D_MODEL;
-    w.layers[i].attn_b = ptr; ptr += 3 * D_MODEL;
-    w.layers[i].attn_proj_w = ptr; ptr += D_MODEL * D_MODEL;
-    w.layers[i].attn_proj_b = ptr; ptr += D_MODEL;
-    w.layers[i].ln2_w = ptr; ptr += D_MODEL;
-    w.layers[i].ln2_b = ptr; ptr += D_MODEL;
-    w.layers[i].mlp_fc_w = ptr; ptr += D_MODEL * 4 * D_MODEL;
-    w.layers[i].mlp_fc_b = ptr; ptr += 4 * D_MODEL;
-    w.layers[i].mlp_proj_w = ptr; ptr += 4 * D_MODEL * D_MODEL;
-    w.layers[i].mlp_proj_b = ptr; ptr += D_MODEL;
+  GPT2Config_init(&config);
+  w.wte = ptr; ptr += config.vocab_size * config.n_embd;
+  w.wpe = ptr; ptr += config.n_positions * config.n_embd;
+  w.layers = (GPT2Layers *)malloc(config.n_layer * sizeof(GPT2Layers));
+  for (int i = 0; i < config.n_layer; i++) {
+    w.layers[i].ln1_w = ptr; ptr += config.n_embd;
+    w.layers[i].ln1_b = ptr; ptr += config.n_embd;
+    w.layers[i].attn_w = ptr; ptr += config.n_embd * 3 * config.n_embd;
+    w.layers[i].attn_b = ptr; ptr += 3 * config.n_embd;
+    w.layers[i].attn_proj_w = ptr; ptr += config.n_embd * config.n_embd;
+    w.layers[i].attn_proj_b = ptr; ptr += config.n_embd;
+    w.layers[i].ln2_w = ptr; ptr += config.n_embd;
+    w.layers[i].ln2_b = ptr; ptr += config.n_embd;
+    w.layers[i].mlp_fc_w = ptr; ptr += config.n_embd * 4 * config.n_embd;
+    w.layers[i].mlp_fc_b = ptr; ptr += 4 * config.n_embd;
+    w.layers[i].mlp_proj_w = ptr; ptr += 4 * config.n_embd * config.n_embd;
+    w.layers[i].mlp_proj_b = ptr; ptr += config.n_embd;
   }
-  w.ln_f_w = ptr; ptr += D_MODEL;
-  w.ln_f_b = ptr; ptr += D_MODEL;
+  w.ln_f_w = ptr; ptr += config.n_embd;
+  w.ln_f_b = ptr; ptr += config.n_embd;
   w.lm_head = ptr;
 
   GPT2State state;
-  GPT2State_init(&state);
+  GPT2State_init(&state, &config);
 
   /* Prompt: "The quick brown fox jumps over the lazy" */
   int prompt_tokens[] = { 464, 2068, 7586, 21831, 18045, 625, 262, 16931 };
@@ -398,17 +408,17 @@ int main() {
 
   while (pos < num_prompt + tokens_to_generate) {
     /* Embedding */
-    for(int i=0; i<D_MODEL; i++) {
-      state.x[i] = w.wte[current_token * D_MODEL + i] + w.wpe[pos * D_MODEL + i];
+    for(int i=0; i<config.n_embd; i++) {
+      state.x[i] = w.wte[current_token * config.n_embd + i] + w.wpe[pos * config.n_embd + i];
     }
 
     /* Forward */
-    for(int i=0; i<N_LAYERS; i++) {
-      transformer_block(state.x, &w, &state, i, pos);
+    for(int i=0; i<config.n_layer; i++) {
+      transformer_block(state.x, &w, &state, &config, i, pos);
     }
 
     /* Final Norm */
-    layernorm(state.final, state.x, w.ln_f_w, w.ln_f_b, D_MODEL);
+    layernorm(state.final, state.x, w.ln_f_w, w.ln_f_b, config.layer_norm_epsilon, config.n_embd);
 
     /* Next Token Logic */
     int next_token;
@@ -416,11 +426,11 @@ int main() {
       next_token = prompt_tokens[pos + 1];
     } else {
       /* Logits */
-      matmul(state.logits, state.final, w.lm_head, NULL, D_MODEL, VOCAB_SIZE);
+      matmul(state.logits, state.final, w.lm_head, NULL, config.n_embd, config.vocab_size);
       
       float max_prob = -1e9;
       int argmax = 0;
-      for(int i=0; i<VOCAB_SIZE; i++) {
+      for(int i=0; i<config.vocab_size; i++) {
         if (state.logits[i] > max_prob) {
           max_prob = state.logits[i];
           argmax = i;
@@ -432,7 +442,7 @@ int main() {
 
     pos++;
     current_token = next_token;
-    if (pos >= MAX_SEQ_LEN) break;
+    if (pos >= config.n_positions) break;
   }
   
   clock_t end = clock();
@@ -440,6 +450,7 @@ int main() {
   printf("Inference finished in %f seconds.\n", time_spent);
 
   free(memory);
+  free(w.layers);
   GPT2State_free(&state);
   return 0;
 }
