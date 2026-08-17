@@ -63,6 +63,8 @@ typedef struct {
   int vocab_size, n_positions, n_embd, n_layer, n_head;
   double layer_norm_epsilon;
   GPT2Activation activation_type;
+  int scale_attn_weights;
+  int tie_word_embeddings;
 } GPT2Config;
 
 typedef struct {
@@ -364,7 +366,7 @@ void attention(float *out, float *x,
     float *cache_k = state->key_cache + cache_offset;
     float *cache_v = state->value_cache + cache_offset;
     float *scores = state->att_scores; 
-    float scale = 1.0f / sqrtf((float)head_size);
+    float scale = config->scale_attn_weights ? (1.0f / sqrtf((float)head_size)) : 1.0f;
     float *head_out;
     int t;
 
@@ -556,6 +558,8 @@ void GPT2Config_init(GPT2Config *config) {
     config->n_positions = 1024;
     config->layer_norm_epsilon = 1e-5f;
     config->activation_type = GPT2_ACTIVATION_GELU;
+    config->scale_attn_weights = 1;
+    config->tie_word_embeddings = 1;
   }
 }
 
@@ -742,7 +746,11 @@ void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
   tensor_to_float(&state->buf, &w->wpe, &wpe_ptr, NULL);
   tensor_to_float(&state->buf, &w->ln_f_w, &ln_f_w_ptr, NULL);
   tensor_to_float(&state->buf, &w->ln_f_b, &ln_f_b_ptr, NULL);
-  tensor_to_float(&state->buf, &w->lm_head, &lm_head_ptr, NULL);
+  if (config->tie_word_embeddings) {
+    lm_head_ptr = wte_ptr;
+  } else {
+    tensor_to_float(&state->buf, &w->lm_head, &lm_head_ptr, NULL);
+  }
   while (pos < num_prompt + param->max_gen_tokens) {
     int i;
     int next_token;
@@ -838,7 +846,9 @@ int main(void) {
   }
   w.ln_f_w = ptr; ptr += config.n_embd;
   w.ln_f_b = ptr; ptr += config.n_embd;
-  w.lm_head = ptr;
+  if (!config.tie_word_embeddings) {
+    w.lm_head = ptr;
+  }
 
   GPT2State_init(&state, &config);
   set_seed(param.seed);
