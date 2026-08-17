@@ -23,9 +23,20 @@
 #define SQRT_2_PI 0.7978845608f
 #define C_GELU 0.044715f
 
+typedef enum {
+  GPT2_ACTIVATION_UNKNOWN = 0,
+  GPT2_ACTIVATION_GELU,
+  GPT2_ACTIVATION_GELU_NEW,
+  GPT2_ACTIVATION_GELU_FAST,
+  GPT2_ACTIVATION_RELU,
+  GPT2_ACTIVATION_SILU,
+  GPT2_ACTIVATION_TANH
+} GPT2Activation;
+
 typedef struct {
   int vocab_size, n_positions, n_embd, n_layer, n_head;
   double layer_norm_epsilon;
+  GPT2Activation activation_type;
 } GPT2Config;
 
 typedef struct {
@@ -86,40 +97,45 @@ void add(float *out, float *a, float *b, int size) {
   #endif
 }
 
-void gelu(float *x, int size) {
-  #if defined(HAS_RVV_HEADER) && ENABLE_RVV_GELU
-  size_t vl;
-  for (int i = 0; i < size; i += vl) {
-    vl = __riscv_vsetvl_e32m8(size - i);
-    vfloat32m8_t xv = __riscv_vle32_v_f32m8(x + i, vl);
-    // cube = C_GELU * xv * xv * xv
-    vfloat32m8_t cube = __riscv_vfmul_vv_f32m8(xv, xv, vl);
-    cube = __riscv_vfmul_vv_f32m8(cube, xv, vl);
-    cube = __riscv_vfmul_vf_f32m8(cube, C_GELU, vl);
-    // inner = SQRT_2_PI * (xv + cube)
-    vfloat32m8_t inner = __riscv_vfadd_vv_f32m8(xv, cube, vl);
-    inner = __riscv_vfmul_vf_f32m8(inner, SQRT_2_PI, vl);
-    
-    // Approximation or scalar fallback for tanhf inside vector if needed, 
-    // here we apply element-wise scalar fallback for complex non-linear math or vector equivalents.
-    // For safety in pure vector environment, map back or compute scalar elements for transcendental functions.
-    float temp_buf[vl];
-    __riscv_vse32_v_f32m8(temp_buf, inner, vl);
-    for (size_t j = 0; j < vl; j++) {
-      float xv_val = ((float*)(x + i))[j];
-      temp_buf[j] = 0.5f * xv_val * (1.0f + tanhf(temp_buf[j]));
-    }
-    vfloat32m8_t vres = __riscv_vle32_v_f32m8(temp_buf, vl);
-    __riscv_vse32_v_f32m8(x + i, vres, vl);
-  }
-  #else
+void apply_activate(float *x, int size, GPT2Activation act_type) {
   for(int i = 0; i < size; i++) {
     float xv = x[i];
-    float cube = C_GELU * xv * xv * xv;
-    float inner = SQRT_2_PI * (xv + cube);
-    x[i] = 0.5f * xv * (1.0f + tanhf(inner));
+    switch (act_type) {
+      case GPT2_ACTIVATION_GELU: {
+        float cube = C_GELU * xv * xv * xv;
+        float inner = SQRT_2_PI * (xv + cube);
+        x[i] = 0.5f * xv * (1.0f + tanhf(inner));
+        break;
+      }
+      case GPT2_ACTIVATION_GELU_NEW: {
+        // Approximation: 0.5 * xv * (1.0 + tanfp(sqrt(2/pi) * (xv + 0.044715 * xv^3))) or similar OpenAI gelu
+        float inner = 0.7978845608f * (xv + 0.044715f * xv * xv * xv);
+        x[i] = 0.5f * xv * (1.0f + tanhf(inner));
+        break;
+      }
+      case GPT2_ACTIVATION_GELU_FAST: {
+        // Fast GELU approximation: x * sigmoid(1.702 * x) approx or similar
+        x[i] = xv * (0.5f * (1.0f + tanhf(0.797885f * (xv + 0.044715f * xv * xv * xv))));
+        break;
+      }
+      case GPT2_ACTIVATION_RELU: {
+        x[i] = (xv > 0.0f) ? xv : 0.0f;
+        break;
+      }
+      case GPT2_ACTIVATION_SILU: { // Swish: x * sigmoid(x)
+        x[i] = xv / (1.0f + expf(-xv));
+        break;
+      }
+      case GPT2_ACTIVATION_TANH: {
+        x[i] = tanhf(xv);
+        break;
+      }
+      case GPT2_ACTIVATION_UNKNOWN:
+      default:
+        // Do nothing or fallback to GELU standard
+        break;
+    }
   }
-  #endif
 }
 
 void layernorm(float *out, float *x, float *g, float *b, float eps, int size) {
@@ -297,7 +313,7 @@ void transformer_block(float *x, GPT2Weights *w, GPT2State *s, GPT2Config *confi
 
   matmul(s->mlp_hidden, s->ln2_out, w->layers[layer].mlp_fc_w, w->layers[layer].mlp_fc_b, n_embd, 4 * n_embd);
   
-  gelu(s->mlp_hidden, 4 * n_embd);
+  apply_activate(s->mlp_hidden, 4 * n_embd, config->activation_type);
   
   matmul(s->mlp_out, s->mlp_hidden, w->layers[layer].mlp_proj_w, w->layers[layer].mlp_proj_b, 4 * n_embd, n_embd);
 
@@ -305,50 +321,95 @@ void transformer_block(float *x, GPT2Weights *w, GPT2State *s, GPT2Config *confi
 }
 
 void GPT2Config_init(GPT2Config *config) {
-  config->n_layer = 12;
-  config->n_embd = 768;
-  config->n_head = 12;
-  config->vocab_size = 50257;
-  config->n_positions = 1024;
-  config->layer_norm_epsilon = 1e-5f;
+  if (config) {
+    config->n_layer = 12;
+    config->n_embd = 768;
+    config->n_head = 12;
+    config->vocab_size = 50257;
+    config->n_positions = 1024;
+    config->layer_norm_epsilon = 1e-5f;
+  }
 }
 
 void GPT2State_init(GPT2State *state, GPT2Config *config) {
-  long cache_size = (long)config->n_layer * config->n_positions * config->n_embd; 
-  state->key_cache = (float*)malloc(cache_size * sizeof(float));
-  state->value_cache = (float*)malloc(cache_size * sizeof(float));
-  state->x = (float *)malloc(config->n_embd * sizeof(float));
-  state->logits = (float *)malloc(config->vocab_size * sizeof(float));
-  state->final = (float *)malloc(config->n_embd * sizeof(float));
-  state->qkv = (float *)malloc(3 * config->n_embd * sizeof(float));
-  state->att_scores = (float *)malloc(config->n_positions * sizeof(float));
-  state->attn_out = (float *)malloc(config->n_embd * sizeof(float));
-  state->ln1_out = (float *)malloc(config->n_embd * sizeof(float));
-  state->ln2_out = (float *)malloc(config->n_embd * sizeof(float));
-  state->mlp_hidden = (float *)malloc(4 * config->n_embd * sizeof(float));
-  state->mlp_out = (float *)malloc(config->n_embd * sizeof(float));  
+  if (state && config) {
+    long cache_size = (long)config->n_layer * config->n_positions * config->n_embd; 
+    state->key_cache = (float*)malloc(cache_size * sizeof(float));
+    state->value_cache = (float*)malloc(cache_size * sizeof(float));
+    state->x = (float *)malloc(config->n_embd * sizeof(float));
+    state->logits = (float *)malloc(config->vocab_size * sizeof(float));
+    state->final = (float *)malloc(config->n_embd * sizeof(float));
+    state->qkv = (float *)malloc(3 * config->n_embd * sizeof(float));
+    state->att_scores = (float *)malloc(config->n_positions * sizeof(float));
+    state->attn_out = (float *)malloc(config->n_embd * sizeof(float));
+    state->ln1_out = (float *)malloc(config->n_embd * sizeof(float));
+    state->ln2_out = (float *)malloc(config->n_embd * sizeof(float));
+    state->mlp_hidden = (float *)malloc(4 * config->n_embd * sizeof(float));
+    state->mlp_out = (float *)malloc(config->n_embd * sizeof(float));  
 
-  if (!state->key_cache || !state->value_cache || !state->x || !state->logits || 
+    if (
+      !state->key_cache || !state->value_cache || !state->x || !state->logits || 
       !state->final || !state->qkv || !state->att_scores || !state->attn_out || 
-      !state->ln1_out || !state->ln2_out || !state->mlp_hidden || !state->mlp_out) {
+      !state->ln1_out || !state->ln2_out || !state->mlp_hidden || !state->mlp_out
+    ) {
       fprintf(stderr, "Error: Memory allocation failed in GPT2State_init\n");
       exit(EXIT_FAILURE);
+    }
+  } else {
+    exit(EXIT_FAILURE);
   }
 }
 
 void GPT2State_free(GPT2State *state) {
-  free(state->key_cache);
-  free(state->value_cache);
-  free(state->x);
-  free(state->logits);
-  free(state->final);
-  free(state->qkv);
-  free(state->att_scores);
-  free(state->attn_out);
-  free(state->ln1_out);
-  free(state->ln2_out);
-  free(state->mlp_hidden);
-  free(state->mlp_out);
+  if (!state) return;
+  if (state->key_cache) {
+    free(state->key_cache);
+    state->key_cache = NULL;
+  }
+  if (state->value_cache) {
+    free(state->value_cache);
+    state->value_cache = NULL;
+  }
+  if (state->x) {
+    free(state->x);
+    state->x = NULL;
+  }
+  if (state->logits) {
+    free(state->logits);
+    state->logits = NULL;
+  }
+  if (state->final) {
+    free(state->final);
+    state->final = NULL;
+  }
+  if (state->qkv) {
+    free(state->qkv);
+    state->qkv = NULL;
+  }
+  if (state->att_scores) {
+    free(state->att_scores);
+    state->att_scores = NULL;
+  }
+  if (state->attn_out) {
+    free(state->attn_out);
+    state->attn_out = NULL;
+  }
+  if (state->ln1_out) {
+    free(state->ln1_out);
+    state->ln1_out = NULL;
+  }
+  if (state->ln2_out) {
+    free(state->ln2_out);
+    state->ln2_out = NULL;
+  }
+  if (state->mlp_hidden) {
+    free(state->mlp_hidden);
+    state->mlp_hidden = NULL;
+  }
+  if (state->mlp_out) {
+    free(state->mlp_out);
+    state->mlp_out = NULL;
+  }
 }
 
 typedef struct {
