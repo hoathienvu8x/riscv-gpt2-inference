@@ -453,6 +453,43 @@ typedef struct {
   unsigned long long seed;
 } GPT2Param;
 
+void generate(GPT2Weights *w, GPT2Config *config, GPT2Param *param,
+  GPT2State *state, int *prompt_tokens, int num_prompt,
+  TokenProbability *vocab_probs) {
+  int current_token = prompt_tokens[0];
+  int pos = 0;
+  while (pos < num_prompt + param->max_gen_tokens) {
+    /* Embedding */
+    for(int i=0; i<config->n_embd; i++) {
+      state->x[i] = w->wte[current_token * config->n_embd + i] + w->wpe[pos * config->n_embd + i];
+    }
+
+    /* Forward */
+    for(int i=0; i<config->n_layer; i++) {
+      transformer_block(state->x, w, state, config, i, pos);
+    }
+
+    /* Final Norm */
+    layernorm(state->final, state->x, w->ln_f_w, w->ln_f_b, config->layer_norm_epsilon, config->n_embd);
+
+    /* Next Token Logic */
+    int next_token;
+    if (pos < num_prompt - 1) {
+      next_token = prompt_tokens[pos + 1];
+    } else {
+      /* Logits */
+      matmul(state->logits, state->final, w->lm_head, NULL, config->n_embd, config->vocab_size);
+
+      next_token = sample(state->logits, config->vocab_size, param->temperature, param->top_k, param->top_p, vocab_probs);
+      printf("Step %d | Token: %d\n", pos, next_token);
+    }
+
+    pos++;
+    current_token = next_token;
+    if (pos >= config->n_positions) break;
+  }
+}
+
 int main() {
   printf("ABLATIONS:\n");
   printf("MatMul:    %s\n", MODE_MATMUL);
@@ -511,45 +548,13 @@ int main() {
   /* Prompt: "The quick brown fox jumps over the lazy" */
   int prompt_tokens[] = { 464, 2068, 7586, 21831, 18045, 625, 262, 16931 };
   int num_prompt = sizeof(prompt_tokens) / sizeof(int);
+  TokenProbability *vocab_probs = (TokenProbability*)malloc(config.vocab_size * sizeof(TokenProbability));
 
   printf("Prompt Length: %d. Generating %d tokens.\n", num_prompt, param.max_gen_tokens);
 
-  int current_token = prompt_tokens[0];
-  int pos = 0;
-  TokenProbability *vocab_probs = (TokenProbability*)malloc(config.vocab_size * sizeof(TokenProbability));
-  
   clock_t start = clock();
 
-  while (pos < num_prompt + param.max_gen_tokens) {
-    /* Embedding */
-    for(int i=0; i<config.n_embd; i++) {
-      state.x[i] = w.wte[current_token * config.n_embd + i] + w.wpe[pos * config.n_embd + i];
-    }
-
-    /* Forward */
-    for(int i=0; i<config.n_layer; i++) {
-      transformer_block(state.x, &w, &state, &config, i, pos);
-    }
-
-    /* Final Norm */
-    layernorm(state.final, state.x, w.ln_f_w, w.ln_f_b, config.layer_norm_epsilon, config.n_embd);
-
-    /* Next Token Logic */
-    int next_token;
-    if (pos < num_prompt - 1) {
-      next_token = prompt_tokens[pos + 1];
-    } else {
-      /* Logits */
-      matmul(state.logits, state.final, w.lm_head, NULL, config.n_embd, config.vocab_size);
-
-      next_token = sample(state.logits, config.vocab_size, param.temperature, param.top_k, param.top_p, vocab_probs);
-      printf("Step %d | Token: %d\n", pos, next_token);
-    }
-
-    pos++;
-    current_token = next_token;
-    if (pos >= config.n_positions) break;
-  }
+  generate(&w, &config, &param, &state, prompt_tokens, num_prompt, vocab_probs);
   
   clock_t end = clock();
   double time_spent = (double)(end - start) / CLOCKS_PER_SEC;
