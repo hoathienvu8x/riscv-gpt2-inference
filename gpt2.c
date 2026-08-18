@@ -168,19 +168,6 @@ static struct gpt2_string_t gpt2_string_s(const char *buf) {
 
 #define gpt2_string_t(s) gpt2_string_s(s)
 
-static struct gpt2_string_t gpt2_string_dup(const struct gpt2_string_t s) {
-  struct gpt2_string_t r = {NULL, 0};
-  if (s.len > 0 && s.buf != NULL) {
-    char *sc = (char *)calloc(1, s.len + 1);
-    if (sc != NULL) {
-      memcpy(sc, s.buf, s.len);
-      sc[s.len] = '\0';
-      r.buf = sc, r.len = s.len;
-    }
-  }
-  return r;
-}
-
 static int gpt2_string_append(
   struct gpt2_string_t *s, const char *buf, size_t len
 ) {
@@ -1005,32 +992,6 @@ static int* gpt2_hashmap_get(
   return NULL;
 }
 
-static int gpt2_hashmap_put_merge(
-  struct gpt2_hashmap_t *map, const struct gpt2_string_t *token1,
-  const struct gpt2_string_t *token2, int rank
-) {
-  int result = GPT2_OK;
-  struct gpt2_string_t merge_key = {0};
-  if (!map || !token1 || !token2) return GPT2_ERR_INVALID;
-
-  if ((float)(map->size + 1) / map->capacity > LOAD_FACTOR_THRESHOLD) {
-    int err = gpt2_hashmap_rehash(map);
-    if (err != GPT2_OK) return err;
-  }
-
-  merge_key.len = token1->len + token2->len;
-  merge_key.buf = (char *)malloc(merge_key.len);
-  if (!merge_key.buf) return GPT2_ERR_NOMEM;
-
-  memcpy(merge_key.buf, token1->buf, token1->len);
-  memcpy(merge_key.buf + token1->len, token2->buf, token2->len);
-  result = gpt2_hashmap_insert(map, &merge_key, rank, 0);
-  if (result != GPT2_OK) {
-    gpt2_string_free(&merge_key);
-  }
-  return result;
-}
-
 static int* gpt2_hashmap_get_merge(
   struct gpt2_hashmap_t *map,
   const struct gpt2_string_t *token1, const struct gpt2_string_t *token2
@@ -1478,10 +1439,6 @@ static int gpt2_load_tokenize_config(
 }
 
 /* Encode / Decoded */
-static int is_utf8_continuation(unsigned char c) {
-  return (c & 0xC0) == 0x80;
-}
-
 static int utf8_char_length(unsigned char c) {
   if ((c & 0x80) == 0x00) return 1;
   if ((c & 0xE0) == 0xC0) return 2;
@@ -1566,7 +1523,6 @@ static int gpt2_pretokenize(const char *input, struct gpt2_string_t **tokens) {
   if (!list) return -1;
 
   size_t i = 0;
-  int is_first_token = 1;
 
   while (i < len) {
     size_t start = i;
@@ -1582,10 +1538,7 @@ static int gpt2_pretokenize(const char *input, struct gpt2_string_t **tokens) {
       cp = ((first_char & 0x07) << 18) | ((input[i+1] & 0x3F) << 12) | ((input[i+2] & 0x3F) << 6) | (input[i+3] & 0x3F);
     }
 
-    int is_whitespace_run = 0;
-
     if (is_space(cp)) {
-      is_whitespace_run = 1;
       while (i < len) {
         int clen = utf8_char_length((unsigned char)input[i]);
         uint32_t next_cp = (unsigned char)input[i];
@@ -1644,73 +1597,11 @@ static int gpt2_pretokenize(const char *input, struct gpt2_string_t **tokens) {
       list[count].buf = (char *)&input[start];
       list[count].len = token_len;
       count++;
-
-      if (is_whitespace_run) {
-        is_first_token = 1;
-      } else {
-        is_first_token = 0;
-      }
     }
   }
 
   *tokens = list;
   return (int)count;
-}
-
-static void gpt2_get_byte_encoder(unsigned char byte_map[256], char *unicode_map[256]) {
-  int bs[256], cs[256], n = 0;
-
-  // Hex: '!' = 0x21, '~' = 0x7E, '¡' = 0xA1, '¬' = 0xAC, '®' = 0xAE, 'ÿ' = 0xFF
-  for (int b = 0x21; b <= 0x7E; b++) { bs[n] = b; cs[n] = b; n++; }
-  for (int b = 0xA1; b <= 0xAC; b++) { bs[n] = b; cs[n] = b; n++; }
-  for (int b = 0xAE; b <= 0xFF; b++) { bs[n] = b; cs[n] = b; n++; }
-
-  int n_val = 0;
-  for (int b = 0; b < 256; b++) {
-    int found = 0;
-    for (int i = 0; i < n; i++) {
-      if (bs[i] == b) { found = 1; break; }
-    }
-    if (!found) {
-      bs[n + n_val] = b;
-      cs[n + n_val] = 256 + n_val;
-      n_val++;
-    }
-  }
-
-  for (int i = 0; i < 256; i++) {
-    unicode_map[i] = NULL;
-    byte_map[i] = 0;
-  }
-
-  for (int i = 0; i < 256; i++) {
-    int b = bs[i];
-    int c = cs[i];
-    char *utf8_str = (char *)malloc(4);
-    int len = 0;
-
-    if (c < 0x80) {
-      utf8_str[0] = (char)c;
-      utf8_str[1] = '\0';
-      len = 1;
-    } else if (c < 0x800) {
-      utf8_str[0] = (char)(0xC0 | (c >> 6));
-      utf8_str[1] = (char)(0x80 | (c & 0x3F));
-      utf8_str[2] = '\0';
-      len = 2;
-    } else {
-      utf8_str[0] = (char)(0xE0 | (c >> 12));
-      utf8_str[1] = (char)(0x80 | ((c >> 6) & 0x3F));
-      utf8_str[2] = (char)(0x80 | (c & 0x3F));
-      utf8_str[3] = '\0';
-      len = 3;
-    }
-
-    unicode_map[b] = utf8_str;
-    if (len > 0) {
-      byte_map[(unsigned char)utf8_str[0]] = (unsigned char)b;
-    }
-  }
 }
 
 static int gpt2_tokenize_encode(struct gpt2_tokenize_t *tokenizer, const char *prompt, int **tokens) {
@@ -3088,6 +2979,206 @@ int gpt2_model_generate(
   return 0;
 }
 
-int main() {
-  return 0;
+/* Debug */
+static const char *get_activation_name(enum gpt2_activation_t act) {
+  switch (act) {
+    case gpt2_activation_gelu:     return "gelu";
+    case gpt2_activation_gelu_new: return "gelu_new";
+    case gpt2_activation_relu:     return "relu";
+    case gpt2_activation_gelu_fast:     return "gelu_fast";
+    case gpt2_activation_silu:     return "silu";
+    case gpt2_activation_tanh:     return "tanh";
+    default:       return "unknown";
+  }
+}
+
+static void gpt2_config_dump(const struct gpt2_config_t* config) {
+  if (config == NULL) {
+    printf("Config pointer is NULL!\n");
+    return;
+  }
+
+  printf("=========================================\n");
+  printf("           GPT-2 CONFIGURATION           \n");
+  printf("=========================================\n");
+
+  printf(" [Architecture]\n");
+  printf("   - Vocab Size         : %d\n", config->vocab_size);
+  printf("   - Max Positions (Context): %d\n", config->n_positions);
+  printf("   - Embedding Dim (n_embd) : %d\n", config->n_embd);
+  printf("   - Layers (n_layer)   : %d\n", config->n_layer);
+  printf("   - Heads (n_head)     : %d\n", config->n_head);
+
+  printf("\n [Hyperparameters]\n");
+  printf("   - LayerNorm Epsilon  : %e\n", config->layer_norm_epsilon);
+  printf(
+    "   - Activation Func    : %s\n",
+    get_activation_name(config->activation_function)
+  );
+  printf(
+    "   - Scale Attn Weights : %s\n",
+    config->scale_attn_weights ? "True" : "False"
+  );
+  printf(
+    "   - Tie Word Embeddings: %s\n",
+    config->tie_word_embeddings ? "True" : "False"
+  );
+
+  printf("\n [Special Token IDs]\n");
+  printf("   - BOS Token ID       : %d\n", config->bos_token_id);
+  printf("   - EOS Token ID       : %d\n", config->eos_token_id);
+  printf("   - PAD Token ID       : %d\n", config->pad_token_id);
+  printf("   - UNK Token ID       : %d\n", config->unk_token_id);
+  printf("=========================================\n");
+}
+
+static void print_gpt2_string(struct gpt2_string_t gpt2) {
+  if (gpt2.buf == NULL || gpt2.len == 0) return;
+  size_t i = 0;
+  while (i < gpt2.len) {
+    if (
+      i + 1 < gpt2.len && (unsigned char)gpt2.buf[i] == 0xC4 &&
+      (unsigned char)gpt2.buf[i+1] == 0xA0
+    ) {
+      putchar(' ');
+      i += 2;
+    } else {
+      putchar(gpt2.buf[i]);
+      i++;
+    }
+  }
+}
+
+static void gpt2_tokenize_dump(
+  const struct gpt2_tokenize_t *tokenize, int max_items
+) {
+  if (!tokenize) {
+    printf("Tokenize struct: NULL\n");
+    return;
+  }
+  size_t vocab_size = tokenize->tokens.size;
+  size_t merges_size = tokenize->merges.size;
+  printf("==================================================\n");
+  printf("               GPT-2 TOKENIZER INFO               \n");
+  printf("==================================================\n");
+  printf(
+    "Vocab Size      : %zu (Capacity: %zu)\n",
+    vocab_size, tokenize->tokens.capacity
+  );
+  printf(
+    "Merges Size     : %zu (Capacity: %zu)\n",
+    merges_size, tokenize->merges.capacity
+  );
+  printf("--------------------------------------------------\n");
+  printf("\n[VOCAB TOKENS]\n");
+  size_t printed_vocab = 0;
+  size_t print_vocab_limit = vocab_size;
+  if (max_items > 0 && (size_t)max_items < vocab_size) {
+    print_vocab_limit = (size_t)max_items;
+  }
+
+  for (
+    size_t i = 0;
+    i < tokenize->tokens.capacity && printed_vocab < print_vocab_limit;
+    i++
+  ) {
+    struct gpt2_node_t t = tokenize->tokens.buckets[i];
+    if (t.state != gpt2_cell_empty) {
+      printf("  [%5zu] ID: %-6d | Token: \"", printed_vocab, t.value);
+      print_gpt2_string(t.key);
+      printf("\" (len: %zu)\n", t.key.len);
+      printed_vocab++;
+    }
+  }
+
+  if (printed_vocab < vocab_size) {
+    printf(
+      "  ... và %zu token khác chưa được in.\n",
+      vocab_size - printed_vocab
+    );
+  }
+
+  /* --- In danh sách Merges --- */
+  printf("\n[MERGE RULES]\n");
+  size_t printed_merges = 0;
+  size_t print_merges_limit = merges_size;
+  if (max_items > 0 && (size_t)max_items < merges_size) {
+    print_merges_limit = (size_t)max_items;
+  }
+
+  for (
+    size_t i = 0;
+    i < tokenize->merges.capacity && printed_merges < print_merges_limit;
+    i++
+  ) {
+    struct gpt2_node_t m = tokenize->merges.buckets[i];
+    if (m.state != gpt2_cell_empty) {
+      printf("  [%5zu] Rank: %-5d | Merge: (\"", printed_merges, m.value);
+      print_gpt2_string(m.key);
+      printf("\")\n");
+      printed_merges++;
+    }
+  }
+
+  if (printed_merges < merges_size) {
+    printf(
+      "  ... và %zu quy tắc merge khác chưa được in.\n",
+      merges_size - printed_merges
+    );
+  }
+
+  printf("==================================================\n");
+}
+/* Debug */
+
+int main(int argc, char **argv) {
+  if (argc > 1) {
+    struct gpt2_model_t model = {0};
+    int num_prompt, *prompt_tokens = NULL;
+    unsigned int seed = 42;
+    // char *respond = NULL;
+    const char *text = "Việt Nam là quốc gia có";
+    struct gpt2_param_t param = {
+      50, 40, 0.8f, 0, &seed
+    };
+    if (gpt2_load_model(argv[1], &model) != GPT2_OK) {
+      return -1;
+    }
+    gpt2_config_dump(&model.config);
+    gpt2_tokenize_dump(&model.tokenize, 5);
+    if (gpt2_state_init(&model)) {
+      gpt2_model_free(&model);
+      return -1;
+    }
+    if (argc > 2) {
+      text = argv[2];
+    }
+    printf("Input:\n %s\n", text);
+    num_prompt = gpt2_model_encode(&model, text, &prompt_tokens);
+    if (num_prompt > 0) {
+      struct gpt2_prob_t *vocab_probs = (struct gpt2_prob_t *)malloc(model.config.vocab_size * sizeof(struct gpt2_prob_t));
+      if (vocab_probs) {
+        int *tokens = NULL, ntok = 0;
+        if (gpt2_model_generate(&model, &param, prompt_tokens, num_prompt, vocab_probs, &tokens, &ntok) == 0) {
+          char *decoded = NULL;
+          if (gpt2_model_decode(&model, tokens, ntok, &decoded) > 0) {
+            printf("Decoded:\n %s\n", decoded);
+            free(decoded);
+          }
+          free(tokens);
+        }
+        free(vocab_probs);
+      }
+      free(prompt_tokens);
+    }
+    /*if (gpt2_model_generate(&model, &param, text, &respond) != -1) {
+      printf("Respond: %s\n", respond);
+      free(respond);
+    }*/
+    // gpt2_model_generate(&model, text, 50, 0.8f, 40, 0.9, &seed);
+    gpt2_state_free(&model);
+    gpt2_model_free(&model);
+    return GPT2_OK;
+  }
+  return -1;
 }
